@@ -1,0 +1,43 @@
+[package]
+name = "p2p_distributed_tswap"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libp2p = { version = "0.56.0", features = [ 
+ "request-response",
+  "tcp",
+  "dns",
+  "noise",
+  "mdns",
+  "yamux",
+  "request-response",
+  "serde",
+  "tokio",
+  "gossipsub",
+  "macros",
+  "quic"
+  ] }
+tokio = { version = "1.46.1", features = ["full"] }
+futures = "0.3"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+libp2p-stream ={ version = "0.4.0-alpha"}
+anyhow = "1.0.98"
+rand = "0.8.5"
+tracing = "0.1.41"
+bincode = { version = "2.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+
+whoami="1.6.0"
+
+[[bin]]
+name = "chat"
+path = "src/test/libp2p/chat.rs"
+
+[[bin]]
+name = "stream"
+path = "src/test/libp2p/stream.rs"
+
+[[bin]]
+name = "sns"
+path = "src/test/libp2p/sns.rs"
