@@ -29,6 +29,13 @@ bincode = { version = "2.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 
 whoami="1.6.0"
+serde_json = "1.0.141"
+
+
+
+
+[build-dependencies]
+tonic-build = "0.13"
 
 [[bin]]
 name = "chat"
@@ -41,3 +48,12 @@ path = "src/test/libp2p/stream.rs"
 [[bin]]
 name = "sns"
 path = "src/test/libp2p/sns.rs"
+
+
+[[bin]]
+name = "agent"
+path = "src/bin/agent.rs"
+
+[[bin]]
+name = "manager"
+path = "src/bin/manager.rs"

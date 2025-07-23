@@ -1,5 +1,5 @@
 {
   "editor.formatOnSave": true,
   "editor.defaultFormatter": "rust-lang.rust-analyzer",
-  "cSpell.ignoreWords": ["libp2p", "gossipsub", "mdns", "tokio", "async", "behaviour", "yamux"],
+  "cSpell.ignoreWords": ["libp2p", "gossipsub", "mdns", "tokio", "async", "behaviour", "yamux", "multiaddr", "mapd", "tswap", "astar"],
 }
