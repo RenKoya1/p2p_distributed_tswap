@@ -220,7 +220,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok(event) => match event {
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer_id, _multiaddr) in &list {
-                        println!("[初期位置決定] mDNS discovered peer: {peer_id}");
+                        println!("[Initial Position Decision] mDNS discovered peer: {peer_id}");
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         discovered_peers.insert(peer_id.to_base58());
                     }
@@ -236,14 +236,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // After peer discovery, send occupied_request and receive occupied_response
 
-    println!("[初期位置決定] occupied_request送信");
+    println!("[Initial Position Decision] Sending occupied_request");
     // 1. Get peer list
     // Use discovered_peers, which is the peer list found by mDNS above
     // 2. If there are no peers except myself, proceed immediately
     if discovered_peers.is_empty()
         || (discovered_peers.len() == 1 && discovered_peers.contains(&local_peer_id_str))
     {
-        println!("[初期位置決定] 他peerがいないため即進みます");
+        println!("[Initial Position Decision] No other peers, proceeding immediately");
     } else {
         // 3. Collect occupied_response from all peers
         let mut received_peers: HashSet<String> = HashSet::new();
@@ -307,14 +307,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     my_point = available_points.choose(&mut thread_rng()).cloned();
     if let Some(p) = my_point {
-        println!("[初期位置決定] 自分の位置: {:?}", p);
+        println!("[Initial Position Decision] My position: {:?}", p);
     } else {
-        println!("[初期位置決定] 空き位置がありません");
+        println!("[Initial Position Decision] No available position");
         return Ok(());
     }
 
     // === Main Loop ===
     let mut stdin = io::BufReader::new(io::stdin()).lines();
+    use std::collections::HashMap;
+    let mut peer_positions: HashMap<String, Point> = HashMap::new();
+    let mut my_task: Option<p2p_distributed_tswap::map::task_generator::Task> = None;
+    let mut last_position_broadcast = std::time::Instant::now();
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
@@ -323,6 +327,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .publish(topic.clone(), line.as_bytes()) {
                     println!("Publish error: {e:?}");
                 }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)), if last_position_broadcast.elapsed() > std::time::Duration::from_secs(1) => {
+                // Periodically broadcast own position
+                if let Some(p) = my_point {
+                    let pos_json = serde_json::json!({
+                        "type": "position",
+                        "peer_id": local_peer_id_str,
+                        "pos": [p.0, p.1]
+                    }).to_string();
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), pos_json.as_bytes()) {
+                        println!("Failed to broadcast position: {e:?}");
+                    }
+                }
+                last_position_broadcast = std::time::Instant::now();
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
@@ -342,22 +360,187 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 },
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
                     println!("Received message: {:?}", message);
+                    // 位置情報受信
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&message.data) {
+                        if val.get("type") == Some(&serde_json::Value::String("position".to_string())) {
+                            if let (Some(peer_id), Some(pos_arr)) = (val.get("peer_id"), val.get("pos")) {
+                                if let (Some(peer_id_str), Some(arr)) = (peer_id.as_str(), pos_arr.as_array()) {
+                                    if arr.len() == 2 {
+                                        if let (Some(x), Some(y)) = (arr[0].as_u64(), arr[1].as_u64()) {
+                                            peer_positions.insert(peer_id_str.to_string(), (x as usize, y as usize));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // occupied_request/responseは既存通り
+                        if let Some(msg_type) = val.get("type") {
+                            println!("[DEBUG] message type: {:?}", msg_type);
+                        }
+                        if val.get("type") == Some(&serde_json::Value::String("occupied_request".to_string())) {
+                            // Check peer_id
+                            let peer_id_val = val.get("peer_id");
+                            if let Some(peer_id_val) = peer_id_val {
+                                println!("[DEBUG] occupied_request peer_id: {:?}, my peer_id: {}", peer_id_val, local_peer_id_str);
+                            }
+                            if let Some(p) = my_point {
+                                let points_json = serde_json::json!({
+                                    "type": "occupied_response",
+                                    "points": [[p.0, p.1]],
+                                    "peer_id": peer_id_val.unwrap_or(&serde_json::Value::String(local_peer_id_str.clone()))
+                                }).to_string();
+                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), points_json.as_bytes()) {
+                                    println!("Error sending occupied_response: {e:?}");
+                                } else {
+                                    println!("[occupied_response] Sent my position ({:?})", p);
+                                }
+                            }
+                        }
+                        if val.get("type") == Some(&serde_json::Value::String("occupied_response".to_string())) {
+                            // If occupied_response is received from another node, add to occupied_points
+                            if let Some(arr) = val.get("points").and_then(|v| v.as_array()) {
+                                for p in arr {
+                                    if let (Some(x), Some(y)) = (
+                                        p.get(0).and_then(|v| v.as_u64()),
+                                        p.get(1).and_then(|v| v.as_u64()),
+                                    ) {
+                                        occupied_points.insert((x as usize, y as usize));
+                                    }
+                                }
+                            }
+                        }
+                        // タスクスワップリクエスト受信
+                        if val.get("type") == Some(&serde_json::Value::String("swap_request".to_string())) {
+                            // swap_request: {type: "swap_request", from_peer: ..., to_peer: ..., task: ...}
+                            if let (Some(from_peer), Some(task_val)) = (val.get("from_peer"), val.get("task")) {
+                                if let Some(from_peer_str) = from_peer.as_str() {
+                                    println!("[SWAP] swap request from {}", from_peer_str);
+                                    // Receiver swaps its own task
+                                    if let Some(my_task_val) = my_task.clone() {
+                                        let swap_response = serde_json::json!({
+                                            "type": "swap_response",
+                                            "from_peer": local_peer_id_str,
+                                            "to_peer": from_peer_str,
+                                            "task": my_task_val
+                                        }).to_string();
+                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), swap_response.as_bytes()) {
+                                            println!("Failed to send swap_response: {e:?}");
+                                        } else {
+                                            println!("Sent swap_response to {}", from_peer_str);
+                                        }
+                                        // 受信したタスクに切り替え
+                                        if let Ok(new_task) = serde_json::from_value::<p2p_distributed_tswap::map::task_generator::Task>(task_val.clone()) {
+                                            my_task = Some(new_task);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // タスクスワップレスポンス受信
+                        if val.get("type") == Some(&serde_json::Value::String("swap_response".to_string())) {
+                    if let Some(task_val) = val.get("task") {
+                        if let Ok(new_task) = serde_json::from_value::<p2p_distributed_tswap::map::task_generator::Task>(task_val.clone()) {
+                            println!("[SWAP] Received swapped task");
+                            my_task = Some(new_task.clone());
+                            // 新しいタスクのpickup/deliveryで経路計算をやり直す
+                            let node_res: std::collections::HashSet<((usize, usize), usize)> = std::collections::HashSet::new();
+                            let edge_res: std::collections::HashSet<(((usize, usize), (usize, usize)), usize)> = std::collections::HashSet::new();
+                            let pickup = Some(new_task.pickup);
+                            let delivery = Some(new_task.delivery);
+                            if let (Some(pickup), Some(delivery), Some(mut current_pos)) = (pickup, delivery, my_point) {
+                                // 1. Move from current position to pickup
+                                if current_pos != pickup {
+                                    println!("Worker: Moving to pickup at {:?}", pickup);
+                                    match astar_with_reservation(&grid, current_pos, pickup, &node_res, &edge_res, 0) {
+                                        Some(path) => {
+                                            println!("Worker: path to pickup for swapped task id={:?}: {:?}", new_task.task_id, path);
+                                            for (step, pos) in path.iter().enumerate() {
+                                                println!("Worker: swapped task id={:?} to pickup step {:?}: pos={:?}", new_task.task_id, step, pos);
+                                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                                current_pos = *pos;
+                                            }
+                                        }
+                                        None => {
+                                            println!("Worker: path to pickup not found for swapped task id={:?}", new_task.task_id);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // 2. Move from pickup to delivery
+                                match astar_with_reservation(&grid, pickup, delivery, &node_res, &edge_res, 0) {
+                                    Some(path) => {
+                                        println!("Worker: path to delivery for swapped task id={:?}: {:?}", new_task.task_id, path);
+                                        for (step, pos) in path.iter().enumerate() {
+                                            println!("Worker: swapped task id={:?} to delivery step {:?}: pos={:?}", new_task.task_id, step, pos);
+                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                            current_pos = *pos;
+                                        }
+                                    }
+                                    None => {
+                                        println!("Worker: path to delivery not found for swapped task id={:?}", new_task.task_id);
+                                        continue;
+                                    }
+                                }
+                                // Update my_point to the new position
+                                my_point = Some(current_pos);
+                                // 完了通知
+                                let done_json = if let Some(task_id) = new_task.task_id {
+                                    serde_json::json!({"status": "done", "task_id": task_id}).to_string()
+                                } else {
+                                    serde_json::json!({"status": "done"}).to_string()
+                                };
+                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), done_json.as_bytes()) {
+                                    println!("Failed to send completion notification: {e:?}");
+                                } else {
+                                    println!("Completion notification ({}) sent", done_json);
+                                }
+                            } else {
+                                println!("Worker: invalid pickup or delivery location for swapped task id={:?}", new_task.task_id);
+                            }
+                        }
+                        }
+                    }
+                        }
+                    // タスク受信
                     if let Ok(task) = serde_json::from_slice::<p2p_distributed_tswap::map::task_generator::Task>(&message.data) {
                         if let Some(ref peer_id) = task.peer_id {
                             if peer_id != &local_peer_id_str {
-
                                 continue;
                             }
                         } else {
                             continue;
                         }
                         println!("-------------------------", );
-                        println!("タスク受信: {:?}", task);
-
+                        println!("Received task: {:?}", task);
+                        my_task = Some(task.clone());
                         let node_res: std::collections::HashSet<((usize, usize), usize)> = std::collections::HashSet::new();
                         let edge_res: std::collections::HashSet<(((usize, usize), (usize, usize)), usize)> = std::collections::HashSet::new();
                         let pickup = Some(task.pickup);
                         let delivery = Some(task.delivery);
+                        // Check if another agent is at the destination
+                        let mut swap_sent = false;
+                        for (peer, pos) in &peer_positions {
+                            if Some(*pos) == pickup || Some(*pos) == delivery {
+                                // Send swap request
+                                let swap_req = serde_json::json!({
+                                    "type": "swap_request",
+                                    "from_peer": local_peer_id_str,
+                                    "to_peer": peer,
+                                    "task": task
+                                }).to_string();
+                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), swap_req.as_bytes()) {
+                                    println!("Failed to send swap_request: {e:?}");
+                                } else {
+                                    println!("Sent swap_request to {}", peer);
+                                }
+                                swap_sent = true;
+                                break;
+                            }
+                        }
+                        if swap_sent {
+                            println!("[SWAP] Waiting for swap response...");
+                            continue;
+                        }
                         // Agent must go from current position to pickup, then from pickup to delivery
                         if let (Some(pickup), Some(delivery), Some(mut current_pos)) = (pickup, delivery, my_point) {
                             // 1. Move from current position to pickup
@@ -414,44 +597,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         println!("--------------------------");
                     }
-                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&message.data) {
-                        if let Some(msg_type) = val.get("type") {
-                            println!("[DEBUG] message type: {:?}", msg_type);
-                        }
-                        if val.get("type") == Some(&serde_json::Value::String("occupied_request".to_string())) {
-                            // Check peer_id
-                            let peer_id_val = val.get("peer_id");
-                            if let Some(peer_id_val) = peer_id_val {
-                                println!("[DEBUG] occupied_request peer_id: {:?}, my peer_id: {}", peer_id_val, local_peer_id_str);
-                            }
-                            if let Some(p) = my_point {
-                                let points_json = serde_json::json!({
-                                    "type": "occupied_response",
-                                    "points": [[p.0, p.1]],
-                                    "peer_id": peer_id_val.unwrap_or(&serde_json::Value::String(local_peer_id_str.clone()))
-                                }).to_string();
-                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), points_json.as_bytes()) {
-                                    println!("occupied_response送信エラー: {e:?}");
-                                } else {
-                                    println!("[occupied_response] 自分の位置({:?})を送信", p);
-                                }
-                            }
-                        }
-                        if val.get("type") == Some(&serde_json::Value::String("occupied_response".to_string())) {
-                            // If occupied_response is received from another node, add to occupied_points
-                            if let Some(arr) = val.get("points").and_then(|v| v.as_array()) {
-                                for p in arr {
-                                    if let (Some(x), Some(y)) = (
-                                        p.get(0).and_then(|v| v.as_u64()),
-                                        p.get(1).and_then(|v| v.as_u64()),
-                                    ) {
-                                        occupied_points.insert((x as usize, y as usize));
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                 },
                 _ => {}
             }

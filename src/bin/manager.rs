@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let topic = gossipsub::IdentTopic::new("mapd");
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+    println!("Peer ID: {}", swarm.local_peer_id());
 
     // 仮のグリッドを作成（実際は適切なグリッドを渡すこと）
     let grid = Arc::new(parse_map());
