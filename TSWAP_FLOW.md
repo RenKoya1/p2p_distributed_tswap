@@ -183,7 +183,7 @@ fn compute_next_move_with_tswap(
                  │
                  ▼ (Gossipsub P2P)
 ┌─────────────────────────────────────────────────────────┐
-│ Agent 2 (自分)                                           │
+│ Agent 2                                      │
 │                                                          │
 │ 1. 他エージェントのpositionメッセージを受信              │
 │    └→ nearby_agents.update(AgentInfo)                   │

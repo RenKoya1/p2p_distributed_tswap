@@ -6,7 +6,7 @@ use libp2p::{
 };
 use p2p_distributed_tswap::map::map::MAP;
 use p2p_distributed_tswap::map::task_generator::{Task, TaskGeneratorAgent};
-use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::error::Error;
@@ -53,7 +53,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
 
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10))
+                .heartbeat_interval(Duration::from_millis(500)) // 500msでハートビート
+                .heartbeat_initial_delay(Duration::from_millis(100)) // 初回ハートビートを100ms後に実行（即座にメッシュ構築）
+                .mesh_n_low(1) // メッシュの最小ピア数を1に設定（デフォルト4）
+                .mesh_n(2) // 目標メッシュピア数を2に設定（デフォルト6）
+                .mesh_n_high(3) // メッシュの最大ピア数を3に設定（デフォルト12）
                 .validation_mode(gossipsub::ValidationMode::Strict)
                 .message_id_fn(message_id_fn)
                 .build()
@@ -83,9 +87,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Enter messages via STDIN and they will be sent to connected peers using MAPD topic");
     println!("Type 'task' to generate and send a task to agents.");
+    println!(
+        "⚠️  IMPORTANT: Wait 1-2 seconds after all agents connect before sending tasks (for Gossipsub mesh to form)!"
+    );
+    println!(
+        "💡 TIP: Look for '🔗 Peer XXX subscribed to topic: mapd' messages to confirm mesh is ready!"
+    );
 
     // 管理用変数
     let mut known_peers: HashSet<libp2p::PeerId> = HashSet::new();
+    // トピックに購読済みのピア（Gossipsubメッシュに参加済み）
+    let mut subscribed_peers: HashSet<libp2p::PeerId> = HashSet::new();
     // 各peerの進行中タスク: peer_id -> Option<Task>
     let mut peer_task_map: HashMap<libp2p::PeerId, Option<Task>> = HashMap::new();
     // タスクIDとpeerの対応: task_id -> peer_id
@@ -97,9 +109,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
                 if line.trim() == "task" {
-                    println!("Known peers: {:?}", known_peers);
+                    println!("Known peers (mDNS): {:?}", known_peers);
+                    println!("Subscribed peers (Gossipsub): {:?}", subscribed_peers);
+                    println!("📡 Sending tasks to subscribed peers...");
+
                     let mut assigned = false;
-                    for peer_id in &known_peers {
+
+                    // subscribed_peersのみに送信
+                    for peer_id in &subscribed_peers {
                         let busy = peer_task_map.get(peer_id).and_then(|t| t.as_ref()).is_some();
                         if !busy {
                             if let Some(mut task) = task_gen.generate_task() {
@@ -110,13 +127,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 task.task_id = Some(task_id);
                                 match serde_json::to_vec(&task) {
                                     Ok(task_bytes) => {
-                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), task_bytes) {
-                                            println!("Task publish error: {e:?}");
-                                        } else {
-                                            println!("Task sent to {peer_id}: {:?}", task);
-                                            peer_task_map.insert(peer_id.clone(), Some(task.clone()));
-                                            task_peer_map.insert(task_id, peer_id.clone());
-                                            assigned = true;
+                                        match swarm.behaviour_mut().gossipsub.publish(topic.clone(), task_bytes) {
+                                            Ok(_) => {
+                                                println!("✅ Task sent to {peer_id}: {:?}", task);
+                                                peer_task_map.insert(peer_id.clone(), Some(task.clone()));
+                                                task_peer_map.insert(task_id, peer_id.clone());
+                                                assigned = true;
+                                            }
+                                            Err(e) => {
+                                                println!("⚠️  Task publish error for {peer_id}: {e:?}");
+                                            }
                                         }
                                     },
                                     Err(e) => println!("Task serialization error: {e:?}"),
@@ -127,8 +147,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
+
                     if !assigned {
-                        println!("全peerにタスクが割り当て済みです");
+                        if subscribed_peers.is_empty() {
+                            println!("⚠️  No peers have subscribed to the topic yet.");
+                            println!("💡 Tip: Wait for '🔗 Peer XXX subscribed to topic: mapd' messages, then try 'task' again.");
+                        } else {
+                            println!("⚠️  All subscribed peers are busy with tasks.");
+                        }
                     }
                 } else {
                     if let Err(e) = swarm
@@ -152,12 +178,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("mDNS discover peer has expired: {peer_id}");
                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                         known_peers.remove(&peer_id);
+                        subscribed_peers.remove(&peer_id);
                         peer_task_map.remove(&peer_id);
                     }
                 },
+                SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                    println!("🔗 Peer {} subscribed to topic: {}", peer_id, topic);
+                    subscribed_peers.insert(peer_id);
+                    println!("   ✅ Total subscribed peers: {}", subscribed_peers.len());
+                }
+                SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
+                    println!("❌ Peer {} unsubscribed from topic: {}", peer_id, topic);
+                    subscribed_peers.remove(&peer_id);
+                }
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source: peer_id,
-                    message_id: id,
+                    message_id: _id,
                     message,
                 })) => {
                     let msg_str = String::from_utf8_lossy(&message.data);

@@ -1,8 +1,13 @@
 # p2p_distributed_tswap
 
 
+cargo clean
+
 ## Test
 
+cargo run --bin manager
+
+cargo run --bin agent
 
 
 

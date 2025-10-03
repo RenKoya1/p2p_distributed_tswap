@@ -49,6 +49,34 @@ struct AgentInfo {
     timestamp: u64,
 }
 
+// ゴール交換リクエスト
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GoalSwapRequest {
+    request_id: String,
+    from_peer: String,
+    to_peer: String,
+    my_goal: Point,
+}
+
+// ゴール交換レスポンス
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GoalSwapResponse {
+    request_id: String,
+    from_peer: String,
+    to_peer: String,
+    my_goal: Point,
+    accepted: bool,
+}
+
+// ターゲットローテーションリクエスト
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TargetRotationRequest {
+    request_id: String,
+    initiator: String,
+    participants: Vec<String>, // デッドロックサイクルのエージェントリスト
+    goals: Vec<Point>,         // 各エージェントの現在のゴール
+}
+
 // 近くのエージェントを管理
 struct NearbyAgents {
     agents: HashMap<String, AgentInfo>,
@@ -67,12 +95,42 @@ impl NearbyAgents {
         self.agents.insert(info.peer_id.clone(), info);
     }
 
-    fn get_nearby(&self, my_pos: Point, radius: usize) -> Vec<AgentInfo> {
-        self.agents
+    fn get_nearby(&self, my_pos: Point, radius: usize, my_peer_id: &str) -> Vec<AgentInfo> {
+        // デバッグ: 全エージェントの距離を出力
+        println!(
+            "[GET_NEARBY] My pos: {:?}, radius: {}, total agents: {}",
+            my_pos,
+            radius,
+            self.agents.len()
+        );
+
+        let nearby: Vec<AgentInfo> = self
+            .agents
             .values()
-            .filter(|agent| manhattan_distance(my_pos, agent.current_pos) <= radius)
-            .cloned()
-            .collect()
+            .filter_map(|agent| {
+                let dist = manhattan_distance(my_pos, agent.current_pos);
+                let is_self = agent.peer_id == my_peer_id;
+                let within_radius = dist <= radius;
+
+                println!(
+                    "  [CHECK] Agent {}: pos={:?}, dist={}, is_self={}, within_radius={}",
+                    &agent.peer_id[..std::cmp::min(8, agent.peer_id.len())],
+                    agent.current_pos,
+                    dist,
+                    is_self,
+                    within_radius
+                );
+
+                if !is_self && within_radius {
+                    Some(agent.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        println!("[GET_NEARBY] Found {} nearby agents", nearby.len());
+        nearby
     }
 
     fn cleanup_old(&mut self, max_age_secs: u64) {
@@ -204,6 +262,15 @@ fn manhattan_distance(p1: Point, p2: Point) -> usize {
 }
 
 // TSWAPベースの次の移動先を計算
+// TSWAPの判定結果
+#[derive(Debug, Clone)]
+enum TswapAction {
+    Move(Point),                              // 移動先
+    WaitForGoalSwap(String),                  // ゴール交換待ち（相手のpeer_id）
+    WaitForRotation(Vec<String>, Vec<Point>), // ローテーション待ち（参加者、ゴール）
+    Wait,                                     // 単純待機
+}
+
 fn compute_next_move_with_tswap(
     my_pos: Point,
     my_goal: Point,
@@ -211,28 +278,48 @@ fn compute_next_move_with_tswap(
     _grid: &[Vec<char>],
     pos2id: &HashMap<Point, usize>,
     nodes: &[Node],
-) -> Point {
+) -> TswapAction {
+    // デバッグ: nearby agents の数を表示
+    println!(
+        "[TSWAP] My pos: {:?}, My goal: {:?}, Nearby agents: {}",
+        my_pos,
+        my_goal,
+        nearby_agents.len()
+    );
+    for agent in nearby_agents {
+        println!(
+            "  - Agent {}: pos={:?}, goal={:?}, distance={}",
+            &agent.peer_id[..8],
+            agent.current_pos,
+            agent.goal_pos,
+            manhattan_distance(my_pos, agent.current_pos)
+        );
+    }
+
     // 自分がゴールに到達している場合は移動しない
     if my_pos == my_goal {
-        return my_pos;
+        return TswapAction::Move(my_pos);
     }
 
     // 自分の現在位置から次に進むべき位置を計算
     let path = get_path(pos2id[&my_pos], pos2id[&my_goal], nodes);
     if path.len() < 2 {
-        return my_pos;
+        return TswapAction::Move(my_pos);
     }
 
     let next_node_id = path[1];
     let next_pos = nodes[next_node_id].pos;
+    println!("[TSWAP] Next position: {:?}", next_pos);
 
     // 次の位置に他のエージェントがいるかチェック
     if let Some(blocking_agent) = nearby_agents.iter().find(|a| a.current_pos == next_pos) {
         // TSWAPロジック: 相手がゴールにいる場合はゴールを交換
         if blocking_agent.current_pos == blocking_agent.goal_pos {
-            println!("[TSWAP] Agent at goal, requesting goal swap");
-            // ゴール交換はメッセージングで行う（後で実装）
-            return my_pos; // 今回は移動しない
+            println!(
+                "[TSWAP] Agent at goal, requesting goal swap with {}",
+                blocking_agent.peer_id
+            );
+            return TswapAction::WaitForGoalSwap(blocking_agent.peer_id.clone());
         }
 
         // デッドロック検出
@@ -272,12 +359,32 @@ fn compute_next_move_with_tswap(
             }
         }
 
+        // デッドロックサイクルを検出したら、ターゲットローテーションを要求
+        if deadlock_chain.len() > 1 {
+            // 参加者とゴールのリストを作成
+            let mut participants = vec![];
+            let mut goals = vec![];
+
+            for pos in &deadlock_chain {
+                if let Some(agent) = nearby_agents.iter().find(|a| &a.current_pos == pos) {
+                    participants.push(agent.peer_id.clone());
+                    goals.push(agent.goal_pos);
+                }
+            }
+
+            if participants.len() > 1 {
+                println!("[TSWAP] Deadlock cycle detected, requesting target rotation");
+                println!("[TSWAP] Participants: {:?}", participants);
+                return TswapAction::WaitForRotation(participants, goals);
+            }
+        }
+
         // 移動できない場合は待機
-        return my_pos;
+        return TswapAction::Wait;
     }
 
     // 移動先が空いていれば移動
-    next_pos
+    TswapAction::Move(next_pos)
 }
 
 #[tokio::main]
@@ -297,7 +404,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
 
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10))
+                .heartbeat_interval(Duration::from_millis(500)) // 500msでハートビート
+                .heartbeat_initial_delay(Duration::from_millis(100)) // 初回ハートビートを100ms後に実行（即座にメッシュ構築）
+                .mesh_n_low(1) // メッシュの最小ピア数を1に設定（デフォルト4）
+                .mesh_n(2) // 目標メッシュピア数を2に設定（デフォルト6）
+                .mesh_n_high(3) // メッシュの最大ピア数を3に設定（デフォルト12）
                 .validation_mode(gossipsub::ValidationMode::Strict)
                 .message_id_fn(message_id_fn)
                 .build()
@@ -317,6 +428,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let topic = gossipsub::IdentTopic::new("mapd");
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     let local_peer_id_str = swarm.local_peer_id().to_base58();
+    println!("✅ Agent Peer ID: {}", local_peer_id_str);
+    println!("✅ Subscribed to topic 'mapd'");
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
@@ -436,15 +549,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    println!("✅ [READY] Agent is ready! Starting main loop...");
+    println!("📍 Initial position: {:?}", my_point.unwrap());
+    println!("⏳ Waiting 2 seconds for Gossipsub mesh to form...");
+
+    // Gossipsubメッシュ構築のための待機
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    println!("🚀 Starting to process tasks!");
+
     // === Main Loop ===
     let mut stdin = io::BufReader::new(io::stdin()).lines();
     let mut peer_positions: HashMap<String, Point> = HashMap::new();
     let mut my_task: Option<p2p_distributed_tswap::map::task_generator::Task> = None;
     let mut last_position_broadcast = std::time::Instant::now();
+    let mut first_broadcast_success = false;
 
     // TSWAPのための近隣エージェント管理
     let mut nearby_agents = NearbyAgents::new();
     let mut my_goal: Point = my_point.unwrap_or((0, 0));
+
+    // ゴール交換とターゲットローテーションの管理
+    let mut pending_goal_swap: Option<String> = None; // 交換待ちのrequest_id
+    let mut pending_rotation: Option<String> = None; // ローテーション待ちのrequest_id
+    let mut goal_swap_requests: HashMap<String, GoalSwapRequest> = HashMap::new();
+    let mut rotation_requests: HashMap<String, TargetRotationRequest> = HashMap::new();
 
     // グリッドをノードグラフに変換（TSWAPで使用）
     let mut pos2id = HashMap::new();
@@ -503,9 +632,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "goal": [my_goal.0, my_goal.1],
                         "timestamp": timestamp
                     }).to_string();
-                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), pos_json.as_bytes()) {
-                        println!("Failed to broadcast position: {e:?}");
+                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), pos_json.as_bytes()) {
+                        Ok(_) => {
+                            if !first_broadcast_success {
+                                println!("📡 [BROADCAST] Successfully broadcasting position to network!");
+                                first_broadcast_success = true;
+                            }
+                            // デバッグ: 定期的に情報を表示
+                            if nearby_agents.agents.len() > 0 {
+                                println!("📡 [BROADCAST] Sent position {:?} -> goal {:?} | Nearby agents: {}",
+                                         p, my_goal, nearby_agents.agents.len());
+                            }
+                        }
+                        Err(e) => {
+                            // NoPeersSubscribedToTopic は正常（他のピアがまだ接続していない）
+                            let err_str = format!("{:?}", e);
+                            if !err_str.contains("NoPeers") {
+                                println!("⚠️  Failed to broadcast position: {e:?}");
+                            } else {
+                                println!("⏳ [BROADCAST] Waiting for peers to subscribe...");
+                            }
+                        }
                     }
+                } else {
+                    println!("⚠️  [BROADCAST] my_point is None, cannot broadcast position");
                 }
                 // 古いエージェント情報をクリーンアップ
                 nearby_agents.cleanup_old(10);
@@ -527,15 +677,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                     }
                 },
+                SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                    println!("🔗 Peer {} subscribed to topic: {}", peer_id, topic);
+                }
+                SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
+                    println!("❌ Peer {} unsubscribed from topic: {}", peer_id, topic);
+                }
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
-                    println!("Received message: {:?}", message);
                     // 位置情報受信（TSWAPのため、ゴール情報も保存）
                     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&message.data) {
+                        // デバッグ: 受信したメッセージのタイプを表示
+                        if let Some(msg_type) = val.get("type").and_then(|v| v.as_str()) {
+                            if msg_type != "position" {
+                                println!("📨 [RECEIVE] Message type: {}", msg_type);
+                            }
+                        }
+
                         if val.get("type") == Some(&serde_json::Value::String("position".to_string())) {
                             if let (Some(peer_id), Some(pos_arr), Some(goal_arr)) =
                                 (val.get("peer_id"), val.get("pos"), val.get("goal")) {
                                 if let (Some(peer_id_str), Some(pos), Some(goal)) =
                                     (peer_id.as_str(), pos_arr.as_array(), goal_arr.as_array()) {
+                                    // 自分自身のメッセージは無視
+                                    if peer_id_str == local_peer_id_str {
+                                        // println!("🔄 [SKIP] Ignoring own position message");
+                                        continue;
+                                    }
+
                                     if pos.len() == 2 && goal.len() == 2 {
                                         if let (Some(px), Some(py), Some(gx), Some(gy)) =
                                             (pos[0].as_u64(), pos[1].as_u64(), goal[0].as_u64(), goal[1].as_u64()) {
@@ -553,6 +721,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 goal_pos,
                                                 timestamp,
                                             });
+                                            println!("📍 [POSITION UPDATE] Agent {}: pos={:?}, goal={:?}, total_tracked={}",
+                                                     &peer_id_str[..std::cmp::min(8, peer_id_str.len())],
+                                                     current_pos, goal_pos, nearby_agents.agents.len());
                                         }
                                     }
                                 }
@@ -594,6 +765,76 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                         }
+
+                        // ゴール交換リクエスト受信
+                        if val.get("type") == Some(&serde_json::Value::String("goal_swap_request".to_string())) {
+                            if let Ok(request) = serde_json::from_value::<GoalSwapRequest>(val.clone()) {
+                                if request.to_peer == local_peer_id_str {
+                                    println!("[GOAL_SWAP] Received goal swap request from {}", request.from_peer);
+                                    println!("[GOAL_SWAP] Their goal: {:?}, My goal: {:?}", request.my_goal, my_goal);
+
+                                    // ゴール交換を受け入れる
+                                    let response = GoalSwapResponse {
+                                        request_id: request.request_id.clone(),
+                                        from_peer: local_peer_id_str.clone(),
+                                        to_peer: request.from_peer.clone(),
+                                        my_goal,
+                                        accepted: true,
+                                    };
+
+                                    let response_json = serde_json::to_string(&response).unwrap();
+                                    let msg = serde_json::json!({
+                                        "type": "goal_swap_response",
+                                        "data": response_json
+                                    }).to_string();
+
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), msg.as_bytes()) {
+                                        println!("[GOAL_SWAP] Failed to send response: {e:?}");
+                                    } else {
+                                        println!("[GOAL_SWAP] Sent response, swapping goals");
+                                        // 自分のゴールを相手のゴールに変更
+                                        my_goal = request.my_goal;
+                                        goal_swap_requests.insert(request.request_id.clone(), request);
+                                    }
+                                }
+                            }
+                        }
+
+                        // ゴール交換レスポンス受信
+                        if val.get("type") == Some(&serde_json::Value::String("goal_swap_response".to_string())) {
+                            if let Some(data_str) = val.get("data").and_then(|v| v.as_str()) {
+                                if let Ok(response) = serde_json::from_str::<GoalSwapResponse>(data_str) {
+                                    if response.to_peer == local_peer_id_str && response.accepted {
+                                        println!("[GOAL_SWAP] Goal swap accepted by {}", response.from_peer);
+                                        println!("[GOAL_SWAP] New goal: {:?}", response.my_goal);
+                                        // 自分のゴールを相手のゴールに変更
+                                        my_goal = response.my_goal;
+                                        pending_goal_swap = None;
+                                    }
+                                }
+                            }
+                        }
+
+                        // ターゲットローテーションリクエスト受信
+                        if val.get("type") == Some(&serde_json::Value::String("target_rotation_request".to_string())) {
+                            if let Ok(request) = serde_json::from_value::<TargetRotationRequest>(val.clone()) {
+                                // 自分がparticipantsに含まれているかチェック
+                                if let Some(my_index) = request.participants.iter().position(|p| p == &local_peer_id_str) {
+                                    println!("[ROTATION] Received rotation request from {}", request.initiator);
+                                    println!("[ROTATION] Participants: {:?}", request.participants);
+
+                                    // 次のエージェントのゴールを自分のゴールにする（ローテーション）
+                                    let next_index = (my_index + 1) % request.participants.len();
+                                    if next_index < request.goals.len() {
+                                        let new_goal = request.goals[next_index];
+                                        println!("[ROTATION] Rotating goal: {:?} -> {:?}", my_goal, new_goal);
+                                        my_goal = new_goal;
+                                        rotation_requests.insert(request.request_id.clone(), request);
+                                    }
+                                }
+                            }
+                        }
+
                         // タスクスワップリクエスト受信
                         if val.get("type") == Some(&serde_json::Value::String("swap_request".to_string())) {
                             // swap_request: {type: "swap_request", from_peer: ..., to_peer: ..., task: ...}
@@ -635,13 +876,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 my_goal = pickup;
                                 println!("Worker: Moving to pickup at {:?} using TSWAP (swapped task)", pickup);
                                 while current_pos != pickup {
-                                    let nearby = nearby_agents.get_nearby(current_pos, 5);
-                                    let next_pos = compute_next_move_with_tswap(
+                                    let nearby = nearby_agents.get_nearby(current_pos, 15, &local_peer_id_str);
+                                    let action = compute_next_move_with_tswap(
                                         current_pos, my_goal, &nearby, &grid, &pos2id, &tswap_nodes,
                                     );
-                                    if next_pos != current_pos {
-                                        current_pos = next_pos;
-                                        my_point = Some(current_pos);
+                                    match action {
+                                        TswapAction::Move(next_pos) => {
+                                            if next_pos != current_pos {
+                                                current_pos = next_pos;
+                                                my_point = Some(current_pos);
+                                            }
+                                        }
+                                        _ => {} // 交換リクエストは省略（簡略版）
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 }
@@ -650,13 +896,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 my_goal = delivery;
                                 println!("Worker: Moving to delivery at {:?} using TSWAP (swapped task)", delivery);
                                 while current_pos != delivery {
-                                    let nearby = nearby_agents.get_nearby(current_pos, 5);
-                                    let next_pos = compute_next_move_with_tswap(
+                                    let nearby = nearby_agents.get_nearby(current_pos, 15, &local_peer_id_str);
+                                    let action = compute_next_move_with_tswap(
                                         current_pos, my_goal, &nearby, &grid, &pos2id, &tswap_nodes,
                                     );
-                                    if next_pos != current_pos {
-                                        current_pos = next_pos;
-                                        my_point = Some(current_pos);
+                                    match action {
+                                        TswapAction::Move(next_pos) => {
+                                            if next_pos != current_pos {
+                                                current_pos = next_pos;
+                                                my_point = Some(current_pos);
+                                            }
+                                        }
+                                        _ => {} // 交換リクエストは省略（簡略版）
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 }
@@ -689,8 +940,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         } else {
                             continue;
                         }
-                        println!("-------------------------", );
-                        println!("Received task: {:?}", task);
+                        println!("=========================");
+                        println!("📦 [TASK RECEIVED] Task ID: {:?}", task.task_id);
+                        println!("   Pickup: {:?} -> Delivery: {:?}", task.pickup, task.delivery);
+                        println!("=========================");
                         my_task = Some(task.clone());
                         let pickup = Some(task.pickup);
                         let delivery = Some(task.delivery);
@@ -723,12 +976,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if let (Some(pickup), Some(delivery), Some(mut current_pos)) = (pickup, delivery, my_point) {
                             // 1. Move from current position to pickup with TSWAP
                             my_goal = pickup;
-                            println!("Worker: Moving to pickup at {:?} using TSWAP", pickup);
+                            println!("🚶 [PHASE 1] Moving to PICKUP at {:?} (current: {:?})", pickup, current_pos);
                             while current_pos != pickup {
-                                let nearby = nearby_agents.get_nearby(current_pos, 5);
-                                println!("[TSWAP] Current: {:?}, Goal: {:?}, Nearby agents: {}", current_pos, my_goal, nearby.len());
+                                let nearby = nearby_agents.get_nearby(current_pos, 15, &local_peer_id_str);
+                                println!("  📍 Current: {:?} -> {:?} (Nearby: {})", current_pos, my_goal, nearby.len());
 
-                                let next_pos = compute_next_move_with_tswap(
+                                let action = compute_next_move_with_tswap(
                                     current_pos,
                                     my_goal,
                                     &nearby,
@@ -737,28 +990,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &tswap_nodes,
                                 );
 
-                                if next_pos == current_pos {
-                                    println!("[TSWAP] Waiting due to collision avoidance...");
-                                } else {
-                                    println!("[TSWAP] Moving {} -> {}",
-                                        format!("{:?}", current_pos),
-                                        format!("{:?}", next_pos));
-                                    current_pos = next_pos;
-                                    my_point = Some(current_pos);
+                                match action {
+                                    TswapAction::Move(next_pos) => {
+                                        if next_pos != current_pos {
+                                            println!("[TSWAP] Moving {} -> {}",
+                                                format!("{:?}", current_pos),
+                                                format!("{:?}", next_pos));
+                                            current_pos = next_pos;
+                                            my_point = Some(current_pos);
+                                        }
+                                    }
+                                    TswapAction::WaitForGoalSwap(peer_id) => {
+                                        println!("[TSWAP] Sending goal swap request to {}", peer_id);
+                                        let request_id = format!("{}_{}", local_peer_id_str, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                                        let request = GoalSwapRequest {
+                                            request_id: request_id.clone(),
+                                            from_peer: local_peer_id_str.clone(),
+                                            to_peer: peer_id,
+                                            my_goal,
+                                        };
+                                        let msg = serde_json::to_value(&request).unwrap();
+                                        let msg_with_type = serde_json::json!({
+                                            "type": "goal_swap_request",
+                                            "request_id": request.request_id,
+                                            "from_peer": request.from_peer,
+                                            "to_peer": request.to_peer,
+                                            "my_goal": [request.my_goal.0, request.my_goal.1]
+                                        }).to_string();
+                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), msg_with_type.as_bytes()) {
+                                            println!("[TSWAP] Failed to send goal swap request: {e:?}");
+                                        }
+                                        pending_goal_swap = Some(request_id);
+                                    }
+                                    TswapAction::WaitForRotation(participants, goals) => {
+                                        println!("[TSWAP] Sending target rotation request");
+                                        println!("[TSWAP] Participants: {:?}", participants);
+                                        let request_id = format!("{}_{}", local_peer_id_str, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                                        let request = TargetRotationRequest {
+                                            request_id: request_id.clone(),
+                                            initiator: local_peer_id_str.clone(),
+                                            participants,
+                                            goals,
+                                        };
+                                        let msg = serde_json::to_value(&request).unwrap();
+                                        let msg_with_type = serde_json::json!({
+                                            "type": "target_rotation_request",
+                                            "request_id": request.request_id,
+                                            "initiator": request.initiator,
+                                            "participants": request.participants,
+                                            "goals": request.goals.iter().map(|g| [g.0, g.1]).collect::<Vec<_>>()
+                                        }).to_string();
+                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), msg_with_type.as_bytes()) {
+                                            println!("[TSWAP] Failed to send rotation request: {e:?}");
+                                        }
+                                        pending_rotation = Some(request_id);
+                                    }
+                                    TswapAction::Wait => {
+                                        println!("[TSWAP] Waiting due to collision avoidance...");
+                                    }
                                 }
 
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             }
-                            println!("Worker: Reached pickup at {:?}", pickup);
+                            println!("✅ [PHASE 1 COMPLETE] Reached PICKUP at {:?}", pickup);
 
                             // 2. Move from pickup to delivery with TSWAP
                             my_goal = delivery;
-                            println!("Worker: Moving to delivery at {:?} using TSWAP", delivery);
+                            println!("🚚 [PHASE 2] Moving to DELIVERY at {:?} (current: {:?})", delivery, current_pos);
                             while current_pos != delivery {
-                                let nearby = nearby_agents.get_nearby(current_pos, 5);
-                                println!("[TSWAP] Current: {:?}, Goal: {:?}, Nearby agents: {}", current_pos, my_goal, nearby.len());
+                                let nearby = nearby_agents.get_nearby(current_pos, 15, &local_peer_id_str);
+                                println!("  📍 Current: {:?} -> {:?} (Nearby: {})", current_pos, my_goal, nearby.len());
 
-                                let next_pos = compute_next_move_with_tswap(
+                                let action = compute_next_move_with_tswap(
                                     current_pos,
                                     my_goal,
                                     &nearby,
@@ -767,22 +1070,70 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &tswap_nodes,
                                 );
 
-                                if next_pos == current_pos {
-                                    println!("[TSWAP] Waiting due to collision avoidance...");
-                                } else {
-                                    println!("[TSWAP] Moving {} -> {}",
-                                        format!("{:?}", current_pos),
-                                        format!("{:?}", next_pos));
-                                    current_pos = next_pos;
-                                    my_point = Some(current_pos);
+                                match action {
+                                    TswapAction::Move(next_pos) => {
+                                        if next_pos != current_pos {
+                                            println!("[TSWAP] Moving {} -> {}",
+                                                format!("{:?}", current_pos),
+                                                format!("{:?}", next_pos));
+                                            current_pos = next_pos;
+                                            my_point = Some(current_pos);
+                                        }
+                                    }
+                                    TswapAction::WaitForGoalSwap(peer_id) => {
+                                        println!("[TSWAP] Sending goal swap request to {}", peer_id);
+                                        let request_id = format!("{}_{}", local_peer_id_str, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                                        let request = GoalSwapRequest {
+                                            request_id: request_id.clone(),
+                                            from_peer: local_peer_id_str.clone(),
+                                            to_peer: peer_id,
+                                            my_goal,
+                                        };
+                                        let msg_with_type = serde_json::json!({
+                                            "type": "goal_swap_request",
+                                            "request_id": request.request_id,
+                                            "from_peer": request.from_peer,
+                                            "to_peer": request.to_peer,
+                                            "my_goal": [request.my_goal.0, request.my_goal.1]
+                                        }).to_string();
+                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), msg_with_type.as_bytes()) {
+                                            println!("[TSWAP] Failed to send goal swap request: {e:?}");
+                                        }
+                                        pending_goal_swap = Some(request_id);
+                                    }
+                                    TswapAction::WaitForRotation(participants, goals) => {
+                                        println!("[TSWAP] Sending target rotation request");
+                                        println!("[TSWAP] Participants: {:?}", participants);
+                                        let request_id = format!("{}_{}", local_peer_id_str, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                                        let request = TargetRotationRequest {
+                                            request_id: request_id.clone(),
+                                            initiator: local_peer_id_str.clone(),
+                                            participants,
+                                            goals,
+                                        };
+                                        let msg_with_type = serde_json::json!({
+                                            "type": "target_rotation_request",
+                                            "request_id": request.request_id,
+                                            "initiator": request.initiator,
+                                            "participants": request.participants,
+                                            "goals": request.goals.iter().map(|g| [g.0, g.1]).collect::<Vec<_>>()
+                                        }).to_string();
+                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), msg_with_type.as_bytes()) {
+                                            println!("[TSWAP] Failed to send rotation request: {e:?}");
+                                        }
+                                        pending_rotation = Some(request_id);
+                                    }
+                                    TswapAction::Wait => {
+                                        println!("[TSWAP] Waiting due to collision avoidance...");
+                                    }
                                 }
 
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             }
-                            println!("Worker: Reached delivery at {:?}", delivery);
+                            println!("✅ [PHASE 2 COMPLETE] Reached DELIVERY at {:?}", delivery);
                             my_point = Some(current_pos);
                         } else {
-                            println!("Worker: invalid pickup or delivery location for task id={:?}", task.task_id);
+                            println!("❌ [ERROR] Invalid pickup or delivery location for task id={:?}", task.task_id);
                         }
                         let reached_goal = true; // Goal reached check (should be determined by logic)
                         if reached_goal {
@@ -793,12 +1144,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 serde_json::json!({"status": "done"}).to_string()
                             };
                             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), done_json.as_bytes()) {
-                                println!("Failed to send completion notification: {e:?}");
+                                println!("❌ [ERROR] Failed to send completion notification: {e:?}");
                             } else {
-                                println!("Completion notification ({}) sent", done_json);
+                                println!("🎉 [TASK COMPLETE] Task ID {:?} finished! Notification sent to manager", task.task_id);
                             }
                         }
-                        println!("--------------------------");
+                        println!("=========================");
                     }
                 },
                 _ => {}
