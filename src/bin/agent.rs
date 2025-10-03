@@ -14,14 +14,10 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
-use p2p_distributed_tswap::algorithm::a_star::{
-    EdgeReservation, NodeReservation, astar_with_reservation,
-};
-use p2p_distributed_tswap::map::agent::Agent;
-use p2p_distributed_tswap::map::agent::AgentState;
 use p2p_distributed_tswap::map::make_node;
 use p2p_distributed_tswap::map::map::MAP;
 use p2p_distributed_tswap::map::map::Point;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::sync::Arc;
 use tokio::{io, io::AsyncBufReadExt, select};
@@ -36,11 +32,61 @@ fn parse_map() -> Vec<Vec<char>> {
 
     grid
 }
+
 #[derive(Clone)]
 struct Node {
     id: usize,
     pos: Point,
     neighbors: Vec<usize>,
+}
+
+// TSWAPに使用するエージェント情報構造体
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AgentInfo {
+    peer_id: String,
+    current_pos: Point,
+    goal_pos: Point,
+    timestamp: u64,
+}
+
+// 近くのエージェントを管理
+struct NearbyAgents {
+    agents: HashMap<String, AgentInfo>,
+    last_cleanup: std::time::Instant,
+}
+
+impl NearbyAgents {
+    fn new() -> Self {
+        NearbyAgents {
+            agents: HashMap::new(),
+            last_cleanup: std::time::Instant::now(),
+        }
+    }
+
+    fn update(&mut self, info: AgentInfo) {
+        self.agents.insert(info.peer_id.clone(), info);
+    }
+
+    fn get_nearby(&self, my_pos: Point, radius: usize) -> Vec<AgentInfo> {
+        self.agents
+            .values()
+            .filter(|agent| manhattan_distance(my_pos, agent.current_pos) <= radius)
+            .cloned()
+            .collect()
+    }
+
+    fn cleanup_old(&mut self, max_age_secs: u64) {
+        if self.last_cleanup.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.agents
+            .retain(|_, agent| now - agent.timestamp < max_age_secs);
+        self.last_cleanup = std::time::Instant::now();
+    }
 }
 
 #[derive(NetworkBehaviour)]
@@ -155,6 +201,83 @@ fn get_path(start: usize, goal: usize, nodes: &[Node]) -> Vec<usize> {
 
 fn manhattan_distance(p1: Point, p2: Point) -> usize {
     ((p1.0 as isize - p2.0 as isize).abs() + (p1.1 as isize - p2.1 as isize).abs()) as usize
+}
+
+// TSWAPベースの次の移動先を計算
+fn compute_next_move_with_tswap(
+    my_pos: Point,
+    my_goal: Point,
+    nearby_agents: &[AgentInfo],
+    _grid: &[Vec<char>],
+    pos2id: &HashMap<Point, usize>,
+    nodes: &[Node],
+) -> Point {
+    // 自分がゴールに到達している場合は移動しない
+    if my_pos == my_goal {
+        return my_pos;
+    }
+
+    // 自分の現在位置から次に進むべき位置を計算
+    let path = get_path(pos2id[&my_pos], pos2id[&my_goal], nodes);
+    if path.len() < 2 {
+        return my_pos;
+    }
+
+    let next_node_id = path[1];
+    let next_pos = nodes[next_node_id].pos;
+
+    // 次の位置に他のエージェントがいるかチェック
+    if let Some(blocking_agent) = nearby_agents.iter().find(|a| a.current_pos == next_pos) {
+        // TSWAPロジック: 相手がゴールにいる場合はゴールを交換
+        if blocking_agent.current_pos == blocking_agent.goal_pos {
+            println!("[TSWAP] Agent at goal, requesting goal swap");
+            // ゴール交換はメッセージングで行う（後で実装）
+            return my_pos; // 今回は移動しない
+        }
+
+        // デッドロック検出
+        let mut visited = HashSet::new();
+        visited.insert(my_pos);
+        let mut current_agent = blocking_agent;
+        let mut deadlock_chain = vec![my_pos];
+
+        loop {
+            if visited.contains(&current_agent.current_pos) {
+                // デッドロックサイクル検出
+                if current_agent.current_pos == my_pos {
+                    println!("[TSWAP] Deadlock detected, need target rotation");
+                    // ターゲットローテーションはメッセージングで調整
+                }
+                break;
+            }
+
+            visited.insert(current_agent.current_pos);
+            deadlock_chain.push(current_agent.current_pos);
+
+            // 次のエージェントを探す
+            if current_agent.current_pos == current_agent.goal_pos {
+                break;
+            }
+
+            // 次のエージェントが進みたい先を確認
+            let blocking_next = nearby_agents.iter().find(|a| {
+                a.current_pos != current_agent.current_pos
+                    && manhattan_distance(current_agent.current_pos, a.current_pos) <= 1
+            });
+
+            if let Some(next) = blocking_next {
+                current_agent = next;
+            } else {
+                break;
+            }
+        }
+
+        // 移動できない場合は待機
+        return my_pos;
+    }
+
+    // 移動先が空いていれば移動
+    next_pos
 }
 
 #[tokio::main]
@@ -315,10 +438,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // === Main Loop ===
     let mut stdin = io::BufReader::new(io::stdin()).lines();
-    use std::collections::HashMap;
     let mut peer_positions: HashMap<String, Point> = HashMap::new();
     let mut my_task: Option<p2p_distributed_tswap::map::task_generator::Task> = None;
     let mut last_position_broadcast = std::time::Instant::now();
+
+    // TSWAPのための近隣エージェント管理
+    let mut nearby_agents = NearbyAgents::new();
+    let mut my_goal: Point = my_point.unwrap_or((0, 0));
+
+    // グリッドをノードグラフに変換（TSWAPで使用）
+    let mut pos2id = HashMap::new();
+    let mut id2pos = vec![];
+    let mut node_id_counter = 0;
+    let h = grid.len();
+    let w = grid[0].len();
+    for y in 0..h {
+        for x in 0..w {
+            if grid[y][x] != '@' {
+                pos2id.insert((x, y), node_id_counter);
+                id2pos.push((x, y));
+                node_id_counter += 1;
+            }
+        }
+    }
+    let mut tswap_nodes = vec![];
+    for (id, &(x, y)) in id2pos.iter().enumerate() {
+        let mut neighbors = vec![];
+        for (dx, dy) in [(0, 1), (1, 0), (0, -1), (-1, 0)] {
+            let nx = x as isize + dx;
+            let ny = y as isize + dy;
+            if nx >= 0 && ny >= 0 {
+                let npos = (nx as usize, ny as usize);
+                if pos2id.contains_key(&npos) {
+                    neighbors.push(pos2id[&npos]);
+                }
+            }
+        }
+        tswap_nodes.push(Node {
+            id,
+            pos: (x, y),
+            neighbors,
+        });
+    }
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
@@ -329,17 +490,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)), if last_position_broadcast.elapsed() > std::time::Duration::from_secs(1) => {
-                // Periodically broadcast own position
+                // Periodically broadcast own position and goal (for TSWAP)
                 if let Some(p) = my_point {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
                     let pos_json = serde_json::json!({
                         "type": "position",
                         "peer_id": local_peer_id_str,
-                        "pos": [p.0, p.1]
+                        "pos": [p.0, p.1],
+                        "goal": [my_goal.0, my_goal.1],
+                        "timestamp": timestamp
                     }).to_string();
                     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), pos_json.as_bytes()) {
                         println!("Failed to broadcast position: {e:?}");
                     }
                 }
+                // 古いエージェント情報をクリーンアップ
+                nearby_agents.cleanup_old(10);
                 last_position_broadcast = std::time::Instant::now();
             }
             event = swarm.select_next_some() => match event {
@@ -360,14 +529,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 },
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
                     println!("Received message: {:?}", message);
-                    // 位置情報受信
+                    // 位置情報受信（TSWAPのため、ゴール情報も保存）
                     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&message.data) {
                         if val.get("type") == Some(&serde_json::Value::String("position".to_string())) {
-                            if let (Some(peer_id), Some(pos_arr)) = (val.get("peer_id"), val.get("pos")) {
-                                if let (Some(peer_id_str), Some(arr)) = (peer_id.as_str(), pos_arr.as_array()) {
-                                    if arr.len() == 2 {
-                                        if let (Some(x), Some(y)) = (arr[0].as_u64(), arr[1].as_u64()) {
-                                            peer_positions.insert(peer_id_str.to_string(), (x as usize, y as usize));
+                            if let (Some(peer_id), Some(pos_arr), Some(goal_arr)) =
+                                (val.get("peer_id"), val.get("pos"), val.get("goal")) {
+                                if let (Some(peer_id_str), Some(pos), Some(goal)) =
+                                    (peer_id.as_str(), pos_arr.as_array(), goal_arr.as_array()) {
+                                    if pos.len() == 2 && goal.len() == 2 {
+                                        if let (Some(px), Some(py), Some(gx), Some(gy)) =
+                                            (pos[0].as_u64(), pos[1].as_u64(), goal[0].as_u64(), goal[1].as_u64()) {
+                                            let current_pos = (px as usize, py as usize);
+                                            let goal_pos = (gx as usize, gy as usize);
+                                            peer_positions.insert(peer_id_str.to_string(), current_pos);
+
+                                            // TSWAPのため近隣エージェント情報を更新
+                                            let timestamp = val.get("timestamp")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0);
+                                            nearby_agents.update(AgentInfo {
+                                                peer_id: peer_id_str.to_string(),
+                                                current_pos,
+                                                goal_pos,
+                                                timestamp,
+                                            });
                                         }
                                     }
                                 }
@@ -442,46 +627,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if let Ok(new_task) = serde_json::from_value::<p2p_distributed_tswap::map::task_generator::Task>(task_val.clone()) {
                             println!("[SWAP] Received swapped task");
                             my_task = Some(new_task.clone());
-                            // 新しいタスクのpickup/deliveryで経路計算をやり直す
-                            let node_res: std::collections::HashSet<((usize, usize), usize)> = std::collections::HashSet::new();
-                            let edge_res: std::collections::HashSet<(((usize, usize), (usize, usize)), usize)> = std::collections::HashSet::new();
+                            // 新しいタスクのpickup/deliveryでTSWAPベースの移動を行う
                             let pickup = Some(new_task.pickup);
                             let delivery = Some(new_task.delivery);
                             if let (Some(pickup), Some(delivery), Some(mut current_pos)) = (pickup, delivery, my_point) {
-                                // 1. Move from current position to pickup
-                                if current_pos != pickup {
-                                    println!("Worker: Moving to pickup at {:?}", pickup);
-                                    match astar_with_reservation(&grid, current_pos, pickup, &node_res, &edge_res, 0) {
-                                        Some(path) => {
-                                            println!("Worker: path to pickup for swapped task id={:?}: {:?}", new_task.task_id, path);
-                                            for (step, pos) in path.iter().enumerate() {
-                                                println!("Worker: swapped task id={:?} to pickup step {:?}: pos={:?}", new_task.task_id, step, pos);
-                                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                                current_pos = *pos;
-                                            }
-                                        }
-                                        None => {
-                                            println!("Worker: path to pickup not found for swapped task id={:?}", new_task.task_id);
-                                            continue;
-                                        }
+                                // 1. Move from current position to pickup with TSWAP
+                                my_goal = pickup;
+                                println!("Worker: Moving to pickup at {:?} using TSWAP (swapped task)", pickup);
+                                while current_pos != pickup {
+                                    let nearby = nearby_agents.get_nearby(current_pos, 5);
+                                    let next_pos = compute_next_move_with_tswap(
+                                        current_pos, my_goal, &nearby, &grid, &pos2id, &tswap_nodes,
+                                    );
+                                    if next_pos != current_pos {
+                                        current_pos = next_pos;
+                                        my_point = Some(current_pos);
                                     }
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 }
-                                // 2. Move from pickup to delivery
-                                match astar_with_reservation(&grid, pickup, delivery, &node_res, &edge_res, 0) {
-                                    Some(path) => {
-                                        println!("Worker: path to delivery for swapped task id={:?}: {:?}", new_task.task_id, path);
-                                        for (step, pos) in path.iter().enumerate() {
-                                            println!("Worker: swapped task id={:?} to delivery step {:?}: pos={:?}", new_task.task_id, step, pos);
-                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                            current_pos = *pos;
-                                        }
+
+                                // 2. Move from pickup to delivery with TSWAP
+                                my_goal = delivery;
+                                println!("Worker: Moving to delivery at {:?} using TSWAP (swapped task)", delivery);
+                                while current_pos != delivery {
+                                    let nearby = nearby_agents.get_nearby(current_pos, 5);
+                                    let next_pos = compute_next_move_with_tswap(
+                                        current_pos, my_goal, &nearby, &grid, &pos2id, &tswap_nodes,
+                                    );
+                                    if next_pos != current_pos {
+                                        current_pos = next_pos;
+                                        my_point = Some(current_pos);
                                     }
-                                    None => {
-                                        println!("Worker: path to delivery not found for swapped task id={:?}", new_task.task_id);
-                                        continue;
-                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 }
-                                // Update my_point to the new position
+
                                 my_point = Some(current_pos);
                                 // 完了通知
                                 let done_json = if let Some(task_id) = new_task.task_id {
@@ -513,8 +692,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("-------------------------", );
                         println!("Received task: {:?}", task);
                         my_task = Some(task.clone());
-                        let node_res: std::collections::HashSet<((usize, usize), usize)> = std::collections::HashSet::new();
-                        let edge_res: std::collections::HashSet<(((usize, usize), (usize, usize)), usize)> = std::collections::HashSet::new();
                         let pickup = Some(task.pickup);
                         let delivery = Some(task.delivery);
                         // Check if another agent is at the destination
@@ -542,41 +719,67 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             continue;
                         }
                         // Agent must go from current position to pickup, then from pickup to delivery
+                        // TSWAPベースの移動ロジックを使用
                         if let (Some(pickup), Some(delivery), Some(mut current_pos)) = (pickup, delivery, my_point) {
-                            // 1. Move from current position to pickup
-                            if current_pos != pickup {
-                                println!("Worker: Moving to pickup at {:?}", pickup);
-                                match astar_with_reservation(&grid, current_pos, pickup, &node_res, &edge_res, 0) {
-                                    Some(path) => {
-                                        println!("Worker: path to pickup for task id={:?}: {:?}", task.task_id, path);
-                                        for (step, pos) in path.iter().enumerate() {
-                                            println!("Worker: task id={:?} to pickup step {:?}: pos={:?}", task.task_id, step, pos);
-                                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                            current_pos = *pos;
-                                        }
-                                    }
-                                    None => {
-                                        println!("Worker: path to pickup not found for task id={:?}", task.task_id);
-                                        continue;
-                                    }
+                            // 1. Move from current position to pickup with TSWAP
+                            my_goal = pickup;
+                            println!("Worker: Moving to pickup at {:?} using TSWAP", pickup);
+                            while current_pos != pickup {
+                                let nearby = nearby_agents.get_nearby(current_pos, 5);
+                                println!("[TSWAP] Current: {:?}, Goal: {:?}, Nearby agents: {}", current_pos, my_goal, nearby.len());
+
+                                let next_pos = compute_next_move_with_tswap(
+                                    current_pos,
+                                    my_goal,
+                                    &nearby,
+                                    &grid,
+                                    &pos2id,
+                                    &tswap_nodes,
+                                );
+
+                                if next_pos == current_pos {
+                                    println!("[TSWAP] Waiting due to collision avoidance...");
+                                } else {
+                                    println!("[TSWAP] Moving {} -> {}",
+                                        format!("{:?}", current_pos),
+                                        format!("{:?}", next_pos));
+                                    current_pos = next_pos;
+                                    my_point = Some(current_pos);
                                 }
+
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             }
-                            // 2. Move from pickup to delivery
-                            match astar_with_reservation(&grid, pickup, delivery, &node_res, &edge_res, 0) {
-                                Some(path) => {
-                                    println!("Worker: path to delivery for task id={:?}: {:?}", task.task_id, path);
-                                    for (step, pos) in path.iter().enumerate() {
-                                        println!("Worker: task id={:?} to delivery step {:?}: pos={:?}", task.task_id, step, pos);
-                                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                        current_pos = *pos;
-                                    }
+                            println!("Worker: Reached pickup at {:?}", pickup);
+
+                            // 2. Move from pickup to delivery with TSWAP
+                            my_goal = delivery;
+                            println!("Worker: Moving to delivery at {:?} using TSWAP", delivery);
+                            while current_pos != delivery {
+                                let nearby = nearby_agents.get_nearby(current_pos, 5);
+                                println!("[TSWAP] Current: {:?}, Goal: {:?}, Nearby agents: {}", current_pos, my_goal, nearby.len());
+
+                                let next_pos = compute_next_move_with_tswap(
+                                    current_pos,
+                                    my_goal,
+                                    &nearby,
+                                    &grid,
+                                    &pos2id,
+                                    &tswap_nodes,
+                                );
+
+                                if next_pos == current_pos {
+                                    println!("[TSWAP] Waiting due to collision avoidance...");
+                                } else {
+                                    println!("[TSWAP] Moving {} -> {}",
+                                        format!("{:?}", current_pos),
+                                        format!("{:?}", next_pos));
+                                    current_pos = next_pos;
+                                    my_point = Some(current_pos);
                                 }
-                                None => {
-                                    println!("Worker: path to delivery not found for task id={:?}", task.task_id);
-                                    continue;
-                                }
+
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             }
-                            // Update my_point to the new position
+                            println!("Worker: Reached delivery at {:?}", delivery);
                             my_point = Some(current_pos);
                         } else {
                             println!("Worker: invalid pickup or delivery location for task id={:?}", task.task_id);
