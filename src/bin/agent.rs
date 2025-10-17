@@ -40,7 +40,7 @@ struct Node {
     neighbors: Vec<usize>,
 }
 
-// TSWAPに使用するエージェント情報構造体
+// Agent information structure for TSWAP
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AgentInfo {
     peer_id: String,
@@ -49,7 +49,7 @@ struct AgentInfo {
     timestamp: u64,
 }
 
-// ゴール交換リクエスト
+// Goal swap request
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct GoalSwapRequest {
     request_id: String,
@@ -58,7 +58,7 @@ struct GoalSwapRequest {
     my_goal: Point,
 }
 
-// ゴール交換レスポンス
+// Goal swap response
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct GoalSwapResponse {
     request_id: String,
@@ -68,16 +68,16 @@ struct GoalSwapResponse {
     accepted: bool,
 }
 
-// ターゲットローテーションリクエスト
+// Target rotation request
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TargetRotationRequest {
     request_id: String,
     initiator: String,
-    participants: Vec<String>, // デッドロックサイクルのエージェントリスト
-    goals: Vec<Point>,         // 各エージェントの現在のゴール
+    participants: Vec<String>, // List of agents in deadlock cycle
+    goals: Vec<Point>,         // Current goal of each agent
 }
 
-// 近くのエージェントを管理
+// Manage nearby agents
 struct NearbyAgents {
     agents: HashMap<String, AgentInfo>,
     last_cleanup: std::time::Instant,
@@ -96,7 +96,7 @@ impl NearbyAgents {
     }
 
     fn get_nearby(&self, my_pos: Point, radius: usize, my_peer_id: &str) -> Vec<AgentInfo> {
-        // デバッグ: 全エージェントの距離を出力
+        // Debug: Output all agents' distances
         println!(
             "[GET_NEARBY] My pos: {:?}, radius: {}, total agents: {}",
             my_pos,
@@ -261,14 +261,14 @@ fn manhattan_distance(p1: Point, p2: Point) -> usize {
     ((p1.0 as isize - p2.0 as isize).abs() + (p1.1 as isize - p2.1 as isize).abs()) as usize
 }
 
-// TSWAPベースの次の移動先を計算
-// TSWAPの判定結果
+// Calculate next move based on TSWAP
+// TSWAP decision result
 #[derive(Debug, Clone)]
 enum TswapAction {
-    Move(Point),                              // 移動先
-    WaitForGoalSwap(String),                  // ゴール交換待ち（相手のpeer_id）
-    WaitForRotation(Vec<String>, Vec<Point>), // ローテーション待ち（参加者、ゴール）
-    Wait,                                     // 単純待機
+    Move(Point),                              // Destination
+    WaitForGoalSwap(String),                  // Waiting for goal swap (peer_id of partner)
+    WaitForRotation(Vec<String>, Vec<Point>), // Waiting for rotation (participants, goals)
+    Wait,                                     // Simple wait
 }
 
 fn compute_next_move_with_tswap(
@@ -472,6 +472,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // After peer discovery, send occupied_request and receive occupied_response
 
+    println!("[Initial Position Decision] Waiting for Gossipsub mesh to stabilize...");
+    // Gossipsubメッシュが形成されるまで待機（他のエージェントがメインループに入るのを待つ）
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     println!("[Initial Position Decision] Sending occupied_request");
     // 1. Get peer list
     // Use discovered_peers, which is the peer list found by mDNS above
@@ -489,7 +493,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .behaviour_mut()
             .gossipsub
             .publish(topic.clone(), req_msg.as_bytes());
-        let collect_timeout = std::time::Duration::from_secs(2);
+        let collect_timeout = std::time::Duration::from_secs(4);
         let collect_start = std::time::Instant::now();
         while collect_start.elapsed() < collect_timeout {
             if received_peers.len() >= discovered_peers.len() {
@@ -506,8 +510,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if val.get("type")
                             == Some(&serde_json::Value::String("occupied_response".to_string()))
                         {
-                            if let Some(arr) = val.get("points").and_then(|v| v.as_array()) {
+                            // "points"と"occupied"の両方に対応（後方互換性）
+                            let arr = val
+                                .get("occupied")
+                                .or_else(|| val.get("points"))
+                                .and_then(|v| v.as_array());
+
+                            if let Some(arr) = arr {
                                 for p in arr {
+                                    // 配列形式: [x, y]
                                     if let (Some(x), Some(y)) = (
                                         p.get(0).and_then(|v| v.as_u64()),
                                         p.get(1).and_then(|v| v.as_u64()),
@@ -625,6 +636,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
+
+                    // 位置情報ブロードキャスト（他のエージェント用）
                     let pos_json = serde_json::json!({
                         "type": "position",
                         "peer_id": local_peer_id_str,
@@ -653,6 +666,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("⏳ [BROADCAST] Waiting for peers to subscribe...");
                             }
                         }
+                    }
+
+                    // Managerへの位置情報送信
+                    let position_update = serde_json::json!({
+                        "type": "position_update",
+                        "peer_id": local_peer_id_str,
+                        "position": [p.0, p.1]
+                    });
+                    if let Ok(update_bytes) = serde_json::to_vec(&position_update) {
+                        let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), update_bytes);
                     }
                 } else {
                     println!("⚠️  [BROADCAST] my_point is None, cannot broadcast position");
@@ -944,6 +967,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("📦 [TASK RECEIVED] Task ID: {:?}", task.task_id);
                         println!("   Pickup: {:?} -> Delivery: {:?}", task.pickup, task.delivery);
                         println!("=========================");
+
+                        // 他のエージェントの位置情報を収集するために少し待機
+                        println!("⏳ Waiting for other agents' position updates...");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                        // 位置情報を即座にブロードキャスト
+                        if let Some(p) = my_point {
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            let pos_json = serde_json::json!({
+                                "type": "position",
+                                "peer_id": local_peer_id_str,
+                                "pos": [p.0, p.1],
+                                "goal": [task.pickup.0, task.pickup.1],
+                                "timestamp": timestamp
+                            }).to_string();
+                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), pos_json.as_bytes());
+                        }
+
+                        println!("✅ Position sync complete. Nearby agents: {}", nearby_agents.agents.len());
+
                         my_task = Some(task.clone());
                         let pickup = Some(task.pickup);
                         let delivery = Some(task.delivery);

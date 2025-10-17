@@ -173,8 +173,8 @@ pub fn tswap_mapd(
 
 fn tswap_step(agents: &mut [Agent], nodes: &[Node]) {
     let n = agents.len();
-    let mut agents_in_swap = vec![false; n]; // 各エージェントが交換に関与しているかを追跡
 
+    // Goal swapping phase
     for i in 0..n {
         if agents[i].v == agents[i].g {
             continue;
@@ -197,9 +197,6 @@ fn tswap_step(agents: &mut [Agent], nodes: &[Node]) {
                 let g_j = agents[j].g;
                 agents[i].g = g_j;
                 agents[j].g = g_i;
-                // 交換に関与したエージェントをマーク
-                agents_in_swap[i] = true;
-                agents_in_swap[j] = true;
             } else {
                 // Deadlock detection
                 let mut a_p = vec![i];
@@ -246,19 +243,14 @@ fn tswap_step(agents: &mut [Agent], nodes: &[Node]) {
                         agents[a_p[k]].g = prev_g;
                     }
                     agents[first_agent_idx].g = last_goal;
-
-                    // target rotationに関与したエージェントをマーク
-                    for &agent_idx in &a_p {
-                        agents_in_swap[agent_idx] = true;
-                    }
                 }
             }
         }
     }
 
-    // 交換に関与していないエージェントのみ移動
+    // Movement phase - 全エージェントが移動可能
     for i in 0..n {
-        if agents[i].v == agents[i].g || agents_in_swap[i] {
+        if agents[i].v == agents[i].g {
             continue;
         }
 
@@ -268,8 +260,20 @@ fn tswap_step(agents: &mut [Agent], nodes: &[Node]) {
         }
         let u = path[1];
 
-        // 移動先が空いている場合のみ移動
-        if !agents.iter().any(|b| b.v == u) {
+        // 移動先が空いている、または相互交換の場合に移動
+        if let Some(j) = agents.iter().position(|b| b.v == u) {
+            if i != j {
+                // Check if this is a mutual swap
+                let path_j = get_path(agents[j].v, agents[j].g, nodes);
+                if path_j.len() >= 2 && path_j[1] == agents[i].v {
+                    // Mutual swap: both agents exchange positions
+                    let temp_v = agents[i].v;
+                    agents[i].v = agents[j].v;
+                    agents[j].v = temp_v;
+                }
+            }
+        } else {
+            // 移動先が空いている場合は通常の移動
             agents[i].v = u;
         }
     }
