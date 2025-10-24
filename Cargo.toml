@@ -49,7 +49,6 @@ path = "src/test/libp2p/stream.rs"
 name = "sns"
 path = "src/test/libp2p/sns.rs"
 
-
 [[bin]]
 name = "agent"
 path = "src/bin/agent.rs"
@@ -57,3 +56,7 @@ path = "src/bin/agent.rs"
 [[bin]]
 name = "manager"
 path = "src/bin/manager.rs"
+
+[[bin]]
+name = "task_test"
+path = "src/test/run/task.rs"

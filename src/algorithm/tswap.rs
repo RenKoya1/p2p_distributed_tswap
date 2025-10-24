@@ -174,8 +174,11 @@ pub fn tswap_mapd(
 fn tswap_step(agents: &mut [Agent], nodes: &[Node]) {
     let n = agents.len();
 
-    // Goal swapping phase
+    // TSWAP Goal Swapping Phase
+    // Rule 3: If agent j is at its goal, swap goals
+    // Rule 4: Deadlock detection and target rotation
     for i in 0..n {
+        // Rule 1: Stay at goal
         if agents[i].v == agents[i].g {
             continue;
         }
@@ -184,21 +187,21 @@ fn tswap_step(agents: &mut [Agent], nodes: &[Node]) {
         if path.len() < 2 {
             continue;
         }
-        let u = path[1];
+        let u = path[1]; // Desired next node
 
         if let Some(j) = agents.iter().position(|b| b.v == u) {
             if i == j {
                 continue;
             }
 
+            // Rule 3: Goal swap when agent j is at its goal
             if agents[j].v == agents[j].g {
-                // Agent j is at its goal, swap goals
                 let g_i = agents[i].g;
                 let g_j = agents[j].g;
                 agents[i].g = g_j;
                 agents[j].g = g_i;
             } else {
-                // Deadlock detection
+                // Rule 4: Deadlock detection and resolution
                 let mut a_p = vec![i];
                 let mut current_b_idx = j;
                 let mut deadlock_found = false;
@@ -234,8 +237,8 @@ fn tswap_step(agents: &mut [Agent], nodes: &[Node]) {
                     }
                 }
 
+                // Rule 4: Rotate targets when deadlock is detected
                 if deadlock_found && a_p.len() > 1 {
-                    // Rotate targets
                     let first_agent_idx = a_p[0];
                     let last_goal = agents[a_p[a_p.len() - 1]].g;
                     for k in (1..a_p.len()).rev() {
@@ -248,7 +251,9 @@ fn tswap_step(agents: &mut [Agent], nodes: &[Node]) {
         }
     }
 
-    // Movement phase - 全エージェントが移動可能
+    // TSWAP Movement Phase
+    // Rule 2: Move to next node if possible
+    // Rule 5: Stay if next node is occupied
     for i in 0..n {
         if agents[i].v == agents[i].g {
             continue;
@@ -260,20 +265,21 @@ fn tswap_step(agents: &mut [Agent], nodes: &[Node]) {
         }
         let u = path[1];
 
-        // 移動先が空いている、または相互交換の場合に移動
+        // Check if next position is available or can be swapped
         if let Some(j) = agents.iter().position(|b| b.v == u) {
             if i != j {
-                // Check if this is a mutual swap
+                // Check for mutual swap (both agents want each other's positions)
                 let path_j = get_path(agents[j].v, agents[j].g, nodes);
                 if path_j.len() >= 2 && path_j[1] == agents[i].v {
-                    // Mutual swap: both agents exchange positions
+                    // Mutual swap: exchange positions simultaneously
                     let temp_v = agents[i].v;
                     agents[i].v = agents[j].v;
                     agents[j].v = temp_v;
                 }
+                // Rule 5: Otherwise stay (next node is occupied)
             }
         } else {
-            // 移動先が空いている場合は通常の移動
+            // Rule 2: Next node is free, move to it
             agents[i].v = u;
         }
     }

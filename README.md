@@ -16,12 +16,21 @@ cargo run --bin manager
 # Wait for: "✅ Manager ready! Listening for agents..."
 
 # 2. Start Agent(s) (Terminal 2, 3, 4...)
+# Option A: Start agents manually
 cargo run --bin agent
+
+# Option B: Start 10 agents automatically (macOS/Linux)
+./start_agents.sh
 
 # Wait for each agent to show: "🚀 Starting to process tasks!"
 
 # 3. In Manager terminal, type "task" to assign tasks
 task
+```
+
+Kill Task
+```
+pkill -f "target/debug/agent"
 ```
 
 **Note:** 

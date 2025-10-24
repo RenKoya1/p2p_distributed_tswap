@@ -130,6 +130,16 @@ impl NearbyAgents {
             .collect();
 
         println!("[GET_NEARBY] Found {} nearby agents", nearby.len());
+        for agent in &nearby {
+            println!(
+                "  - Agent {}: pos={:?}, goal={:?}, distance={}",
+                &agent.peer_id[..std::cmp::min(8, agent.peer_id.len())],
+                agent.current_pos,
+                agent.goal_pos,
+                manhattan_distance(my_pos, agent.current_pos)
+            );
+        }
+
         nearby
     }
 
@@ -279,7 +289,7 @@ fn compute_next_move_with_tswap(
     pos2id: &HashMap<Point, usize>,
     nodes: &[Node],
 ) -> TswapAction {
-    // デバッグ: nearby agents の数を表示
+    // Debug: Display nearby agents count
     println!(
         "[TSWAP] My pos: {:?}, My goal: {:?}, Nearby agents: {}",
         my_pos,
@@ -296,12 +306,12 @@ fn compute_next_move_with_tswap(
         );
     }
 
-    // 自分がゴールに到達している場合は移動しない
+    // Rule 1: Stay at goal
     if my_pos == my_goal {
         return TswapAction::Move(my_pos);
     }
 
-    // 自分の現在位置から次に進むべき位置を計算
+    // Calculate next desired position from current position
     let path = get_path(pos2id[&my_pos], pos2id[&my_goal], nodes);
     if path.len() < 2 {
         return TswapAction::Move(my_pos);
@@ -311,9 +321,9 @@ fn compute_next_move_with_tswap(
     let next_pos = nodes[next_node_id].pos;
     println!("[TSWAP] Next position: {:?}", next_pos);
 
-    // 次の位置に他のエージェントがいるかチェック
+    // Check if another agent is at the next position
     if let Some(blocking_agent) = nearby_agents.iter().find(|a| a.current_pos == next_pos) {
-        // TSWAPロジック: 相手がゴールにいる場合はゴールを交換
+        // Rule 3: TSWAP logic - swap goals if the other agent is at its goal
         if blocking_agent.current_pos == blocking_agent.goal_pos {
             println!(
                 "[TSWAP] Agent at goal, requesting goal swap with {}",
@@ -322,50 +332,64 @@ fn compute_next_move_with_tswap(
             return TswapAction::WaitForGoalSwap(blocking_agent.peer_id.clone());
         }
 
-        // デッドロック検出
-        let mut visited = HashSet::new();
-        visited.insert(my_pos);
+        // Rule 4: Deadlock detection
+        let mut a_p = vec![my_pos]; // Positions in potential deadlock cycle
         let mut current_agent = blocking_agent;
-        let mut deadlock_chain = vec![my_pos];
+        let mut deadlock_found = false;
 
         loop {
-            if visited.contains(&current_agent.current_pos) {
-                // デッドロックサイクル検出
-                if current_agent.current_pos == my_pos {
-                    println!("[TSWAP] Deadlock detected, need target rotation");
-                    // ターゲットローテーションはメッセージングで調整
-                }
-                break;
-            }
-
-            visited.insert(current_agent.current_pos);
-            deadlock_chain.push(current_agent.current_pos);
-
-            // 次のエージェントを探す
+            // If current agent is at its goal, no deadlock
             if current_agent.current_pos == current_agent.goal_pos {
                 break;
             }
 
-            // 次のエージェントが進みたい先を確認
-            let blocking_next = nearby_agents.iter().find(|a| {
-                a.current_pos != current_agent.current_pos
-                    && manhattan_distance(current_agent.current_pos, a.current_pos) <= 1
-            });
+            // Get the next position the current agent wants to move to
+            if let Some(current_node_id) = pos2id.get(&current_agent.current_pos) {
+                if let Some(goal_node_id) = pos2id.get(&current_agent.goal_pos) {
+                    let agent_path = get_path(*current_node_id, *goal_node_id, nodes);
+                    if agent_path.len() < 2 {
+                        break;
+                    }
+                    let next_desired_pos = nodes[agent_path[1]].pos;
 
-            if let Some(next) = blocking_next {
-                current_agent = next;
+                    // Find the agent at the next desired position
+                    if let Some(next_agent) = nearby_agents
+                        .iter()
+                        .find(|a| a.current_pos == next_desired_pos)
+                    {
+                        // Check if we've already visited this position (cycle detected)
+                        if a_p.contains(&next_agent.current_pos) {
+                            // Check if this completes a cycle back to our position
+                            if next_agent.current_pos == my_pos {
+                                deadlock_found = true;
+                                break;
+                            }
+                            // Otherwise, not a valid deadlock for us
+                            a_p.clear();
+                            break;
+                        }
+
+                        a_p.push(current_agent.current_pos);
+                        current_agent = next_agent;
+                    } else {
+                        // Next position is empty, no deadlock
+                        break;
+                    }
+                } else {
+                    break;
+                }
             } else {
                 break;
             }
         }
 
-        // デッドロックサイクルを検出したら、ターゲットローテーションを要求
-        if deadlock_chain.len() > 1 {
-            // 参加者とゴールのリストを作成
+        // Rule 4: If deadlock is detected, request target rotation
+        if deadlock_found && a_p.len() > 1 {
+            // Create list of participants and their goals
             let mut participants = vec![];
             let mut goals = vec![];
 
-            for pos in &deadlock_chain {
+            for pos in &a_p {
                 if let Some(agent) = nearby_agents.iter().find(|a| &a.current_pos == pos) {
                     participants.push(agent.peer_id.clone());
                     goals.push(agent.goal_pos);
@@ -379,11 +403,11 @@ fn compute_next_move_with_tswap(
             }
         }
 
-        // 移動できない場合は待機
+        // Rule 5: Cannot move, wait
         return TswapAction::Wait;
     }
 
-    // 移動先が空いていれば移動
+    // Rule 2: Next position is free, move to it
     TswapAction::Move(next_pos)
 }
 
@@ -404,11 +428,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
 
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_millis(500)) // 500msでハートビート
-                .heartbeat_initial_delay(Duration::from_millis(100)) // 初回ハートビートを100ms後に実行（即座にメッシュ構築）
-                .mesh_n_low(1) // メッシュの最小ピア数を1に設定（デフォルト4）
-                .mesh_n(2) // 目標メッシュピア数を2に設定（デフォルト6）
-                .mesh_n_high(3) // メッシュの最大ピア数を3に設定（デフォルト12）
+                .heartbeat_interval(Duration::from_millis(500)) // Heartbeat every 500ms
+                .heartbeat_initial_delay(Duration::from_millis(100)) // First heartbeat after 100ms (build mesh quickly)
+                .mesh_n_low(1) // Minimum peers in mesh (default: 4)
+                .mesh_n(2) // Target mesh peers (default: 6)
+                .mesh_n_high(3) // Maximum peers in mesh (default: 12)
                 .validation_mode(gossipsub::ValidationMode::Strict)
                 .message_id_fn(message_id_fn)
                 .build()
@@ -473,7 +497,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // After peer discovery, send occupied_request and receive occupied_response
 
     println!("[Initial Position Decision] Waiting for Gossipsub mesh to stabilize...");
-    // Gossipsubメッシュが形成されるまで待機（他のエージェントがメインループに入るのを待つ）
+    // Wait for Gossipsub mesh to form (wait for other agents to enter main loop)
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     println!("[Initial Position Decision] Sending occupied_request");
