@@ -428,7 +428,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
 
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_millis(500)) // Heartbeat every 500ms
+                .heartbeat_interval(Duration::from_millis(250)) // Heartbeat every 250ms (faster)
                 .heartbeat_initial_delay(Duration::from_millis(100)) // First heartbeat after 100ms (build mesh quickly)
                 .mesh_n_low(1) // Minimum peers in mesh (default: 4)
                 .mesh_n(2) // Target mesh peers (default: 6)
@@ -653,7 +653,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("Publish error: {e:?}");
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)), if last_position_broadcast.elapsed() > std::time::Duration::from_secs(1) => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)), if last_position_broadcast.elapsed() > std::time::Duration::from_millis(500) => {
                 // Periodically broadcast own position and goal (for TSWAP)
                 if let Some(p) = my_point {
                     let timestamp = std::time::SystemTime::now()
@@ -936,7 +936,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         }
                                         _ => {} // 交換リクエストは省略（簡略版）
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                 }
 
                                 // 2. Move from pickup to delivery with TSWAP
@@ -956,7 +956,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         }
                                         _ => {} // 交換リクエストは省略（簡略版）
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                 }
 
                                 my_point = Some(current_pos);
@@ -992,9 +992,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("   Pickup: {:?} -> Delivery: {:?}", task.pickup, task.delivery);
                         println!("=========================");
 
-                        // 他のエージェントの位置情報を収集するために少し待機
-                        println!("⏳ Waiting for other agents' position updates...");
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        // タスク受信時の計測情報を送信
+                        if let Some(task_id) = task.task_id {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            let metric_msg = serde_json::json!({
+                                "type": "task_metric_received",
+                                "task_id": task_id,
+                                "peer_id": local_peer_id_str,
+                                "timestamp_ms": now_ms
+                            }).to_string();
+                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), metric_msg.as_bytes());
+                        }
 
                         // 位置情報を即座にブロードキャスト
                         if let Some(p) = my_point {
@@ -1013,6 +1024,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
 
                         println!("✅ Position sync complete. Nearby agents: {}", nearby_agents.agents.len());
+
+                        // タスク処理開始時の計測情報を送信
+                        if let Some(task_id) = task.task_id {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            let metric_msg = serde_json::json!({
+                                "type": "task_metric_started",
+                                "task_id": task_id,
+                                "peer_id": local_peer_id_str,
+                                "timestamp_ms": now_ms
+                            }).to_string();
+                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), metric_msg.as_bytes());
+                        }
 
                         my_task = Some(task.clone());
                         let pickup = Some(task.pickup);
@@ -1120,7 +1146,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                             }
                             println!("✅ [PHASE 1 COMPLETE] Reached PICKUP at {:?}", pickup);
 
@@ -1198,7 +1224,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                             }
                             println!("✅ [PHASE 2 COMPLETE] Reached DELIVERY at {:?}", delivery);
                             my_point = Some(current_pos);
@@ -1207,6 +1233,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         let reached_goal = true; // Goal reached check (should be determined by logic)
                         if reached_goal {
+                            // タスク完了時の計測情報を送信
+                            if let Some(task_id) = task.task_id {
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as u64;
+                                let metric_msg = serde_json::json!({
+                                    "type": "task_metric_completed",
+                                    "task_id": task_id,
+                                    "peer_id": local_peer_id_str,
+                                    "timestamp_ms": now_ms
+                                }).to_string();
+                                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), metric_msg.as_bytes());
+                            }
+
                             // Publish completion notification including task_id
                             let done_json = if let Some(task_id) = task.task_id {
                                 serde_json::json!({"status": "done", "task_id": task_id}).to_string()

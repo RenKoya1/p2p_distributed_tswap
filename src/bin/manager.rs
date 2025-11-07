@@ -6,6 +6,7 @@ use libp2p::{
 };
 use p2p_distributed_tswap::map::map::MAP;
 use p2p_distributed_tswap::map::task_generator::{Task, TaskGeneratorAgent};
+use p2p_distributed_tswap::map::task_metrics::{TaskMetric, TaskMetricsCollector};
 
 use std::collections::HashMap;
 use std::collections::{HashSet, hash_map::DefaultHasher};
@@ -38,6 +39,14 @@ struct MapdBehaviour {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Check for --clean flag to ignore mDNS discoveries
+    let args: Vec<String> = std::env::args().collect();
+    let ignore_mdns = args.contains(&"--clean".to_string());
+
+    if ignore_mdns {
+        println!("🧹 Running in CLEAN mode - ignoring mDNS discoveries");
+    }
+
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -85,6 +94,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
+    println!("✅ Manager started fresh!");
+    println!("⏳ Clearing any cached peer information...");
+
+    // Give a brief moment to ensure clean state
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
     println!("Enter messages via STDIN and they will be sent to connected peers using MAPD topic");
     println!("Type 'task' to generate and send a task to agents.");
     println!(
@@ -93,10 +108,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "💡 TIP: Look for '🔗 Peer XXX subscribed to topic: mapd' messages to confirm mesh is ready!"
     );
-    println!("⏳ Waiting 2 seconds for initial Gossipsub mesh setup...");
+    println!("⏳ Waiting 1 second for initial Gossipsub mesh setup...");
 
     // Wait for Gossipsub mesh initialization
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     println!("✅ Manager ready! Listening for agents...");
 
@@ -112,10 +127,124 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut task_counter: u64 = 0;
     // Track current position of each agent: peer_id -> (x, y)
     let mut peer_positions: HashMap<String, (usize, usize)> = HashMap::new();
+
+    // === Task Metrics Collection ===
+    let mut metrics_collector = TaskMetricsCollector::new();
+    println!("📊 Task metrics collection initialized");
+
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
-                if line.trim() == "task" {
+                let trimmed = line.trim();
+
+                // メトリクス表示コマンド
+                if trimmed == "metrics" {
+                    let stats = metrics_collector.get_statistics();
+                    println!("{}", stats);
+                    continue;
+                }
+
+                // Peerをリセットするコマンド
+                if trimmed == "reset" {
+                    known_peers.clear();
+                    subscribed_peers.clear();
+                    peer_task_map.clear();
+                    task_peer_map.clear();
+                    peer_positions.clear();
+                    metrics_collector = TaskMetricsCollector::new();
+                    task_counter = 0;
+                    println!("✅ All peers and state cleared. Ready for fresh start!");
+                    continue;
+                }
+
+                // CSV保存コマンド
+                if trimmed.starts_with("save ") {
+                    let filename = &trimmed[5..];
+                    let csv_content = metrics_collector.to_csv_string();
+                    match std::fs::write(filename, csv_content) {
+                        Ok(_) => println!("✅ Metrics saved to {}", filename),
+                        Err(e) => println!("⚠️  Failed to save metrics: {e:?}"),
+                    }
+                    continue;
+                }
+
+                // タスク分割・送信コマンド
+                if trimmed.starts_with("tasks ") {
+                    let num_str = &trimmed[6..];
+                    if let Ok(num_tasks) = num_str.parse::<usize>() {
+                        // Gossipsubから実際に購読しているピアを取得して同期
+                        for peer in swarm.behaviour_mut().gossipsub.all_peers() {
+                            if peer.1.iter().any(|t| t.as_str() == "mapd") {
+                                subscribed_peers.insert(peer.0.clone());
+                            }
+                        }
+
+                        println!("📡 Sending {} tasks to subscribed peers...", num_tasks);
+                        println!("   Subscribed peers: {}", subscribed_peers.len());
+
+                        let mut sent_count = 0;
+                        let mut round = 0;
+
+                        // ラウンドベースでタスクを配分
+                        while sent_count < num_tasks {
+                            let mut sent_in_round = false;
+                            for peer_id in &subscribed_peers {
+                                if sent_count >= num_tasks {
+                                    break;
+                                }
+
+                                let busy = peer_task_map.get(peer_id).and_then(|t| t.as_ref()).is_some();
+                                if !busy {
+                                    if let Some(mut task) = task_gen.generate_task() {
+                                        task_counter += 1;
+                                        let task_id = task_counter;
+                                        task.peer_id = Some(peer_id.to_base58());
+                                        task.task_id = Some(task_id);
+
+                                        // タスク計測情報を作成
+                                        let metric = TaskMetric::new(task_id, peer_id.to_base58());
+                                        metrics_collector.add_metric(metric);
+
+                                        match serde_json::to_vec(&task) {
+                                            Ok(task_bytes) => {
+                                                match swarm.behaviour_mut().gossipsub.publish(topic.clone(), task_bytes) {
+                                                    Ok(_) => {
+                                                        println!("✅ Task {} sent to {} (round {})", task_id, peer_id, round + 1);
+                                                        peer_task_map.insert(peer_id.clone(), Some(task.clone()));
+                                                        task_peer_map.insert(task_id, peer_id.clone());
+                                                        sent_count += 1;
+                                                        sent_in_round = true;
+                                                    }
+                                                    Err(e) => {
+                                                        println!("⚠️  Task publish error for {}: {e:?}", peer_id);
+                                                    }
+                                                }
+                                            },
+                                            Err(e) => println!("Task serialization error: {e:?}"),
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+                                }
+                            }
+
+                            if !sent_in_round {
+                                println!("⚠️  No agents available in round {}", round + 1);
+                                break;
+                            }
+                            round += 1;
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+
+                        println!("✅ Sent {} tasks in {} rounds", sent_count, round);
+                        println!("💡 Tip: Use 'metrics' to view statistics or 'save <filename>' to save results");
+                        continue;
+                    } else {
+                        println!("⚠️  Invalid number of tasks. Usage: tasks <number>");
+                        continue;
+                    }
+                }
+
+                if trimmed == "task" {
                     // Gossipsubから実際に購読しているピアを取得して同期
                     for peer in swarm.behaviour_mut().gossipsub.all_peers() {
                         if peer.1.iter().any(|t| t.as_str() == "mapd") {
@@ -139,11 +268,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let task_id = task_counter;
                                 task.peer_id = Some(peer_id.to_base58());
                                 task.task_id = Some(task_id);
+
+                                // タスク計測情報を作成
+                                let metric = TaskMetric::new(task_id, peer_id.to_base58());
+                                metrics_collector.add_metric(metric);
+
                                 match serde_json::to_vec(&task) {
                                     Ok(task_bytes) => {
                                         match swarm.behaviour_mut().gossipsub.publish(topic.clone(), task_bytes) {
                                             Ok(_) => {
-                                                println!("✅ Task sent to {peer_id}: {:?}", task);
+                                                println!("✅ Task {} sent to {peer_id}: {:?}", task_id, task);
                                                 peer_task_map.insert(peer_id.clone(), Some(task.clone()));
                                                 task_peer_map.insert(task_id, peer_id.clone());
                                                 assigned = true;
@@ -155,14 +289,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     },
                                     Err(e) => println!("Task serialization error: {e:?}"),
                                 }
-                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                tokio::time::sleep(Duration::from_millis(150)).await;
                             } else {
                                 println!("Task generation failed (not enough free cells)");
                             }
                         }
-                    }
-
-                    if !assigned {
+                    }                    if !assigned {
                         if subscribed_peers.is_empty() {
                             println!("⚠️  No peers have subscribed to the topic yet.");
                             println!("💡 Tip: Wait for '🔗 Peer XXX subscribed to topic: mapd' messages, then try 'task' again.");
@@ -170,7 +302,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("⚠️  All subscribed peers are busy with tasks.");
                         }
                     }
-                } else {
+                } else if trimmed != "metrics" && trimmed != "task" && !trimmed.starts_with("save ") && !trimmed.starts_with("tasks ") {
                     if let Err(e) = swarm
                         .behaviour_mut().gossipsub
                         .publish(topic.clone(), line.as_bytes()) {
@@ -180,21 +312,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    for (peer_id, _multiaddr) in list {
-                        println!("mDNS discovered a new peer: {peer_id}");
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                        known_peers.insert(peer_id.clone());
-                        peer_task_map.entry(peer_id.clone()).or_insert(None);
+                    if ignore_mdns {
+                        // In clean mode, ignore all mDNS discoveries
+                        for (peer_id, _multiaddr) in list {
+                            println!("⏭️  Ignoring mDNS peer (--clean mode): {peer_id}");
+                        }
+                    } else {
+                        for (peer_id, _multiaddr) in list {
+                            println!("mDNS discovered a new peer: {peer_id}");
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            known_peers.insert(peer_id.clone());
+                            peer_task_map.entry(peer_id.clone()).or_insert(None);
 
-                        // 少し待ってからGossipsubの購読状態をチェック
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                            // 少し待ってからGossipsubの購読状態をチェック
+                            tokio::time::sleep(Duration::from_millis(100)).await;
 
-                        // ピアがトピックに購読しているかチェック
-                        for peer_info in swarm.behaviour_mut().gossipsub.all_peers() {
-                            if peer_info.0 == &peer_id && peer_info.1.iter().any(|t| t.as_str() == "mapd") {
-                                subscribed_peers.insert(peer_id.clone());
-                                println!("   ✅ Peer {} is already subscribed to 'mapd'", peer_id);
-                                break;
+                            // ピアがトピックに購読しているかチェック
+                            for peer_info in swarm.behaviour_mut().gossipsub.all_peers() {
+                                if peer_info.0 == &peer_id && peer_info.1.iter().any(|t| t.as_str() == "mapd") {
+                                    subscribed_peers.insert(peer_id.clone());
+                                    println!("   ✅ Peer {} is already subscribed to 'mapd'", peer_id);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -270,13 +409,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                             continue;
                         }
+
+                        // タスク計測情報の受信
+                        if let Some(msg_type) = request.get("type").and_then(|v| v.as_str()) {
+                            match msg_type {
+                                "task_metric_received" => {
+                                    if let Some(task_id) = request.get("task_id").and_then(|v| v.as_u64()) {
+                                        metrics_collector.update_received(task_id);
+                                        println!("   📊 Task {} received by agent", task_id);
+                                    }
+                                    continue;
+                                }
+                                "task_metric_started" => {
+                                    if let Some(task_id) = request.get("task_id").and_then(|v| v.as_u64()) {
+                                        metrics_collector.update_started(task_id);
+                                        println!("   📊 Task {} started processing", task_id);
+                                    }
+                                    continue;
+                                }
+                                "task_metric_completed" => {
+                                    if let Some(task_id) = request.get("task_id").and_then(|v| v.as_u64()) {
+                                        metrics_collector.update_completed(task_id);
+                                        println!("   📊 Task {} marked as completed", task_id);
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
 
                     // Receive completion notification as JSON, and redistribute tasks only if status=="done" and task_id exists
                     if let Ok(done_msg) = serde_json::from_str::<serde_json::Value>(&msg_str) {
                         if done_msg.get("status") == Some(&serde_json::Value::String("done".to_string())) {
                             let task_id = done_msg.get("task_id").and_then(|v| v.as_u64());
-                            println!("Received task completion notification: {peer_id}, task_id: {:?}", task_id);
+                            println!("✅ Received task completion notification: {peer_id}, task_id: {:?}", task_id);
+
                             peer_task_map.insert(peer_id.clone(), None);
                             // 新しいタスクを生成して配布
                             if let Some(mut task) = task_gen.generate_task() {
@@ -284,12 +452,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let new_task_id = task_counter;
                                 task.peer_id = Some(peer_id.to_base58());
                                 task.task_id = Some(new_task_id);
+
+                                // 新しいタスクの計測情報を作成
+                                let metric = TaskMetric::new(new_task_id, peer_id.to_base58());
+                                metrics_collector.add_metric(metric);
+
                                 match serde_json::to_vec(&task) {
                                     Ok(task_bytes) => {
                                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), task_bytes) {
                                             println!("Task publish error: {e:?}");
                                         } else {
-                                            println!("Task sent to {peer_id}: {:?}", task);
+                                            println!("✅ Task {} sent to {peer_id}: {:?}", new_task_id, task);
                                             peer_task_map.insert(peer_id.clone(), Some(task.clone()));
                                             task_peer_map.insert(new_task_id, peer_id.clone());
                                         }
