@@ -77,6 +77,17 @@ struct TargetRotationRequest {
     goals: Vec<Point>,         // Current goal of each agent
 }
 
+// Task state machine
+#[derive(Clone, Debug, PartialEq)]
+enum TaskState {
+    Idle,
+    MovingToPickup,
+    MovingToDelivery,
+    WaitingForGoalSwap(String, std::time::Instant), // peer_id, request_time
+    WaitingForRotation(String, std::time::Instant), // request_id, request_time
+    Completed,
+}
+
 // Manage nearby agents
 struct NearbyAgents {
     agents: HashMap<String, AgentInfo>,
@@ -271,6 +282,34 @@ fn manhattan_distance(p1: Point, p2: Point) -> usize {
     ((p1.0 as isize - p2.0 as isize).abs() + (p1.1 as isize - p2.1 as isize).abs()) as usize
 }
 
+fn publish_path_metric(
+    swarm: &mut libp2p::Swarm<MapdBehaviour>,
+    topic: &gossipsub::IdentTopic,
+    peer_id: &str,
+    duration_micros: u128,
+) {
+    let duration = std::cmp::min(duration_micros, u64::MAX as u128) as u64;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let metric_msg = serde_json::json!({
+        "type": "path_metric",
+        "peer_id": peer_id,
+        "duration_micros": duration,
+        "timestamp_ms": timestamp
+    })
+    .to_string();
+
+    if let Err(e) = swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic.clone(), metric_msg.as_bytes())
+    {
+        println!("⚠️  Failed to publish path metric: {e:?}");
+    }
+}
+
 // Calculate next move based on TSWAP
 // TSWAP decision result
 #[derive(Debug, Clone)]
@@ -288,7 +327,8 @@ fn compute_next_move_with_tswap(
     _grid: &[Vec<char>],
     pos2id: &HashMap<Point, usize>,
     nodes: &[Node],
-) -> TswapAction {
+) -> (TswapAction, u128) {
+    let start = std::time::Instant::now();
     // Debug: Display nearby agents count
     println!(
         "[TSWAP] My pos: {:?}, My goal: {:?}, Nearby agents: {}",
@@ -307,108 +347,112 @@ fn compute_next_move_with_tswap(
     }
 
     // Rule 1: Stay at goal
-    if my_pos == my_goal {
-        return TswapAction::Move(my_pos);
-    }
+    let action = if my_pos == my_goal {
+        TswapAction::Move(my_pos)
+    } else {
+        // Calculate next desired position from current position
+        let path = get_path(pos2id[&my_pos], pos2id[&my_goal], nodes);
+        if path.len() < 2 {
+            TswapAction::Move(my_pos)
+        } else {
+            let next_node_id = path[1];
+            let next_pos = nodes[next_node_id].pos;
+            println!("[TSWAP] Next position: {:?}", next_pos);
 
-    // Calculate next desired position from current position
-    let path = get_path(pos2id[&my_pos], pos2id[&my_goal], nodes);
-    if path.len() < 2 {
-        return TswapAction::Move(my_pos);
-    }
+            // Check if another agent is at the next position
+            if let Some(blocking_agent) = nearby_agents.iter().find(|a| a.current_pos == next_pos) {
+                // Rule 3: TSWAP logic - swap goals if the other agent is at its goal
+                if blocking_agent.current_pos == blocking_agent.goal_pos {
+                    println!(
+                        "[TSWAP] Agent at goal, requesting goal swap with {}",
+                        blocking_agent.peer_id
+                    );
+                    TswapAction::WaitForGoalSwap(blocking_agent.peer_id.clone())
+                } else {
+                    // Rule 4: Deadlock detection
+                    let mut a_p = vec![my_pos]; // Positions in potential deadlock cycle
+                    let mut current_agent = blocking_agent;
+                    let mut deadlock_found = false;
 
-    let next_node_id = path[1];
-    let next_pos = nodes[next_node_id].pos;
-    println!("[TSWAP] Next position: {:?}", next_pos);
-
-    // Check if another agent is at the next position
-    if let Some(blocking_agent) = nearby_agents.iter().find(|a| a.current_pos == next_pos) {
-        // Rule 3: TSWAP logic - swap goals if the other agent is at its goal
-        if blocking_agent.current_pos == blocking_agent.goal_pos {
-            println!(
-                "[TSWAP] Agent at goal, requesting goal swap with {}",
-                blocking_agent.peer_id
-            );
-            return TswapAction::WaitForGoalSwap(blocking_agent.peer_id.clone());
-        }
-
-        // Rule 4: Deadlock detection
-        let mut a_p = vec![my_pos]; // Positions in potential deadlock cycle
-        let mut current_agent = blocking_agent;
-        let mut deadlock_found = false;
-
-        loop {
-            // If current agent is at its goal, no deadlock
-            if current_agent.current_pos == current_agent.goal_pos {
-                break;
-            }
-
-            // Get the next position the current agent wants to move to
-            if let Some(current_node_id) = pos2id.get(&current_agent.current_pos) {
-                if let Some(goal_node_id) = pos2id.get(&current_agent.goal_pos) {
-                    let agent_path = get_path(*current_node_id, *goal_node_id, nodes);
-                    if agent_path.len() < 2 {
-                        break;
-                    }
-                    let next_desired_pos = nodes[agent_path[1]].pos;
-
-                    // Find the agent at the next desired position
-                    if let Some(next_agent) = nearby_agents
-                        .iter()
-                        .find(|a| a.current_pos == next_desired_pos)
-                    {
-                        // Check if we've already visited this position (cycle detected)
-                        if a_p.contains(&next_agent.current_pos) {
-                            // Check if this completes a cycle back to our position
-                            if next_agent.current_pos == my_pos {
-                                deadlock_found = true;
-                                break;
-                            }
-                            // Otherwise, not a valid deadlock for us
-                            a_p.clear();
+                    loop {
+                        // If current agent is at its goal, no deadlock
+                        if current_agent.current_pos == current_agent.goal_pos {
                             break;
                         }
 
-                        a_p.push(current_agent.current_pos);
-                        current_agent = next_agent;
-                    } else {
-                        // Next position is empty, no deadlock
-                        break;
+                        // Get the next position the current agent wants to move to
+                        if let Some(current_node_id) = pos2id.get(&current_agent.current_pos) {
+                            if let Some(goal_node_id) = pos2id.get(&current_agent.goal_pos) {
+                                let agent_path = get_path(*current_node_id, *goal_node_id, nodes);
+                                if agent_path.len() < 2 {
+                                    break;
+                                }
+                                let next_desired_pos = nodes[agent_path[1]].pos;
+
+                                // Find the agent at the next desired position
+                                if let Some(next_agent) = nearby_agents
+                                    .iter()
+                                    .find(|a| a.current_pos == next_desired_pos)
+                                {
+                                    // Check if we've already visited this position (cycle detected)
+                                    if a_p.contains(&next_agent.current_pos) {
+                                        // Check if this completes a cycle back to our position
+                                        if next_agent.current_pos == my_pos {
+                                            deadlock_found = true;
+                                        } else {
+                                            a_p.clear();
+                                        }
+                                        break;
+                                    }
+
+                                    a_p.push(current_agent.current_pos);
+                                    current_agent = next_agent;
+                                } else {
+                                    // Next position is empty, no deadlock
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
                     }
-                } else {
-                    break;
+
+                    if deadlock_found && a_p.len() > 1 {
+                        // Create list of participants and their goals
+                        let mut participants = vec![];
+                        let mut goals = vec![];
+
+                        for pos in &a_p {
+                            if let Some(agent) =
+                                nearby_agents.iter().find(|a| &a.current_pos == pos)
+                            {
+                                participants.push(agent.peer_id.clone());
+                                goals.push(agent.goal_pos);
+                            }
+                        }
+
+                        if participants.len() > 1 {
+                            println!("[TSWAP] Deadlock cycle detected, requesting target rotation");
+                            println!("[TSWAP] Participants: {:?}", participants);
+                            TswapAction::WaitForRotation(participants, goals)
+                        } else {
+                            TswapAction::Wait
+                        }
+                    } else {
+                        // Rule 5: Cannot move, wait
+                        TswapAction::Wait
+                    }
                 }
             } else {
-                break;
+                // Rule 2: Next position is free, move to it
+                TswapAction::Move(next_pos)
             }
         }
+    };
 
-        // Rule 4: If deadlock is detected, request target rotation
-        if deadlock_found && a_p.len() > 1 {
-            // Create list of participants and their goals
-            let mut participants = vec![];
-            let mut goals = vec![];
-
-            for pos in &a_p {
-                if let Some(agent) = nearby_agents.iter().find(|a| &a.current_pos == pos) {
-                    participants.push(agent.peer_id.clone());
-                    goals.push(agent.goal_pos);
-                }
-            }
-
-            if participants.len() > 1 {
-                println!("[TSWAP] Deadlock cycle detected, requesting target rotation");
-                println!("[TSWAP] Participants: {:?}", participants);
-                return TswapAction::WaitForRotation(participants, goals);
-            }
-        }
-
-        // Rule 5: Cannot move, wait
-        return TswapAction::Wait;
-    }
-
-    // Rule 2: Next position is free, move to it
-    TswapAction::Move(next_pos)
+    (action, start.elapsed().as_micros())
 }
 
 #[tokio::main]
@@ -604,11 +648,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut nearby_agents = NearbyAgents::new();
     let mut my_goal: Point = my_point.unwrap_or((0, 0));
 
+    // Task state machine
+    let mut task_state = TaskState::Idle;
+    let mut goal_swap_timeout = Duration::from_secs(3);
+    let mut rotation_timeout = Duration::from_secs(5);
+
     // ゴール交換とターゲットローテーションの管理
-    let mut pending_goal_swap: Option<String> = None; // 交換待ちのrequest_id
-    let mut pending_rotation: Option<String> = None; // ローテーション待ちのrequest_id
     let mut goal_swap_requests: HashMap<String, GoalSwapRequest> = HashMap::new();
     let mut rotation_requests: HashMap<String, TargetRotationRequest> = HashMap::new();
+    let mut pending_goal_swap: Option<String> = None;
+    let mut pending_rotation: Option<String> = None;
+
+    // Movement timer for regular TSWAP-based movement
+    let mut last_movement = std::time::Instant::now();
+    let movement_interval = Duration::from_millis(200); // Move every 200ms
 
     // グリッドをノードグラフに変換（TSWAPで使用）
     let mut pos2id = HashMap::new();
@@ -924,9 +977,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("Worker: Moving to pickup at {:?} using TSWAP (swapped task)", pickup);
                                 while current_pos != pickup {
                                     let nearby = nearby_agents.get_nearby(current_pos, 15, &local_peer_id_str);
-                                    let action = compute_next_move_with_tswap(
+                                    let (action, duration_micros) = compute_next_move_with_tswap(
                                         current_pos, my_goal, &nearby, &grid, &pos2id, &tswap_nodes,
                                     );
+                                    publish_path_metric(&mut swarm, &topic, &local_peer_id_str, duration_micros);
                                     match action {
                                         TswapAction::Move(next_pos) => {
                                             if next_pos != current_pos {
@@ -944,9 +998,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("Worker: Moving to delivery at {:?} using TSWAP (swapped task)", delivery);
                                 while current_pos != delivery {
                                     let nearby = nearby_agents.get_nearby(current_pos, 15, &local_peer_id_str);
-                                    let action = compute_next_move_with_tswap(
+                                    let (action, duration_micros) = compute_next_move_with_tswap(
                                         current_pos, my_goal, &nearby, &grid, &pos2id, &tswap_nodes,
                                     );
+                                    publish_path_metric(&mut swarm, &topic, &local_peer_id_str, duration_micros);
                                     match action {
                                         TswapAction::Move(next_pos) => {
                                             if next_pos != current_pos {
@@ -1045,6 +1100,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let delivery = Some(task.delivery);
                         // Check if another agent is at the destination
                         let mut swap_sent = false;
+
                         for (peer, pos) in &peer_positions {
                             if Some(*pos) == pickup || Some(*pos) == delivery {
                                 // Send swap request
@@ -1074,10 +1130,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             my_goal = pickup;
                             println!("🚶 [PHASE 1] Moving to PICKUP at {:?} (current: {:?})", pickup, current_pos);
                             while current_pos != pickup {
+                                // Check if we're waiting for a response
+                                if pending_goal_swap.is_some() || pending_rotation.is_some() {
+                                    println!("[TSWAP] Waiting for goal swap or rotation response, pausing movement");
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    continue;
+                                }
+
                                 let nearby = nearby_agents.get_nearby(current_pos, 15, &local_peer_id_str);
                                 println!("  📍 Current: {:?} -> {:?} (Nearby: {})", current_pos, my_goal, nearby.len());
 
-                                let action = compute_next_move_with_tswap(
+                                let (action, duration_micros) = compute_next_move_with_tswap(
                                     current_pos,
                                     my_goal,
                                     &nearby,
@@ -1085,6 +1148,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &pos2id,
                                     &tswap_nodes,
                                 );
+                                publish_path_metric(&mut swarm, &topic, &local_peer_id_str, duration_micros);
 
                                 match action {
                                     TswapAction::Move(next_pos) => {
@@ -1157,7 +1221,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let nearby = nearby_agents.get_nearby(current_pos, 15, &local_peer_id_str);
                                 println!("  📍 Current: {:?} -> {:?} (Nearby: {})", current_pos, my_goal, nearby.len());
 
-                                let action = compute_next_move_with_tswap(
+                                let (action, duration_micros) = compute_next_move_with_tswap(
                                     current_pos,
                                     my_goal,
                                     &nearby,
@@ -1165,6 +1229,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &pos2id,
                                     &tswap_nodes,
                                 );
+                                publish_path_metric(&mut swarm, &topic, &local_peer_id_str, duration_micros);
 
                                 match action {
                                     TswapAction::Move(next_pos) => {

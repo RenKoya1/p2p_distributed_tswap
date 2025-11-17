@@ -50,12 +50,20 @@ name = "sns"
 path = "src/test/libp2p/sns.rs"
 
 [[bin]]
-name = "agent"
-path = "src/bin/agent.rs"
+name = "agent-decentralized"
+path = "src/bin/decentralized/agent.rs"
 
 [[bin]]
-name = "manager"
-path = "src/bin/manager.rs"
+name = "manager-decentralized"
+path = "src/bin/decentralized/manager.rs"
+
+[[bin]]
+name = "manager-centralized"
+path = "src/bin/centralized/manager.rs"
+
+[[bin]]
+name = "agent-centralized"
+path = "src/bin/centralized/agent.rs"
 
 [[bin]]
 name = "task_test"

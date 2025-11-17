@@ -6,10 +6,12 @@ use libp2p::{
 };
 use p2p_distributed_tswap::map::map::MAP;
 use p2p_distributed_tswap::map::task_generator::{Task, TaskGeneratorAgent};
-use p2p_distributed_tswap::map::task_metrics::{TaskMetric, TaskMetricsCollector};
+use p2p_distributed_tswap::map::task_metrics::{
+    PathComputationMetrics, TaskMetric, TaskMetricsCollector,
+};
 
 use std::collections::HashMap;
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -67,8 +69,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .mesh_n_low(1) // Minimum mesh peers set to 1 (default 4)
                 .mesh_n(2) // Target mesh peers set to 2 (default 6)
                 .mesh_n_high(3) // Maximum mesh peers set to 3 (default 12)
-                .validation_mode(gossipsub::ValidationMode::Strict)
+                .validation_mode(gossipsub::ValidationMode::Permissive)
                 .message_id_fn(message_id_fn)
+                .history_length(5)  // メッセージ履歴を5に制限（デフォルト5だが明示）
+                .history_gossip(3)  // Gossip履歴を3に制限（デフォルト3だが明示）
+                .max_transmit_size(1_048_576)  // 最大送信サイズを1MBに制限
                 .build()
                 .map_err(io::Error::other)?;
 
@@ -103,6 +108,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Enter messages via STDIN and they will be sent to connected peers using MAPD topic");
     println!("Type 'task' to generate and send a task to agents.");
     println!(
+        "Use 'metrics' for summary stats, 'save <filename>' for task metrics CSV, and 'save path <filename>' for path computation CSV."
+    );
+    println!(
         "⚠️  IMPORTANT: Wait 3-5 seconds after all agents connect before sending tasks (for Gossipsub mesh to form)!"
     );
     println!(
@@ -130,7 +138,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // === Task Metrics Collection ===
     let mut metrics_collector = TaskMetricsCollector::new();
+    let mut path_metrics = PathComputationMetrics::new();
     println!("📊 Task metrics collection initialized");
+    println!("⏱️ Path computation metrics collection initialized");
 
     loop {
         select! {
@@ -141,6 +151,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if trimmed == "metrics" {
                     let stats = metrics_collector.get_statistics();
                     println!("{}", stats);
+                    if let Some(path_stats) = path_metrics.get_statistics() {
+                        println!("{}", path_stats);
+                    } else {
+                        println!("⏱️ Path Computation: no samples yet");
+                    }
                     continue;
                 }
 
@@ -153,11 +168,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     peer_positions.clear();
                     metrics_collector = TaskMetricsCollector::new();
                     task_counter = 0;
+                    path_metrics.clear();
                     println!("✅ All peers and state cleared. Ready for fresh start!");
                     continue;
                 }
 
                 // CSV保存コマンド
+                if trimmed.starts_with("save path ") {
+                    let filename = trimmed["save path ".len()..].trim();
+                    if filename.is_empty() {
+                        println!("⚠️  Usage: save path <filename>");
+                    } else {
+                        match std::fs::write(filename, path_metrics.to_csv_string()) {
+                            Ok(_) => println!("💾 Saved path metrics to {}", filename),
+                            Err(e) => println!("⚠️  Failed to save path metrics: {e:?}"),
+                        }
+                    }
+                    continue;
+                }
+
                 if trimmed.starts_with("save ") {
                     let filename = &trimmed[5..];
                     let csv_content = metrics_collector.to_csv_string();
@@ -236,7 +265,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
 
                         println!("✅ Sent {} tasks in {} rounds", sent_count, round);
-                        println!("💡 Tip: Use 'metrics' to view statistics or 'save <filename>' to save results");
+                        println!("💡 Tip: Use 'metrics' to view statistics, 'save <filename>' for task metrics, or 'save path <filename>' for path metrics");
                         continue;
                     } else {
                         println!("⚠️  Invalid number of tasks. Usage: tasks <number>");
@@ -431,6 +460,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     if let Some(task_id) = request.get("task_id").and_then(|v| v.as_u64()) {
                                         metrics_collector.update_completed(task_id);
                                         println!("   📊 Task {} marked as completed", task_id);
+                                    }
+                                    continue;
+                                }
+                                "path_metric" => {
+                                    if let Some(duration) = request.get("duration_micros").and_then(|v| v.as_u64()) {
+                                        path_metrics.record_micros(duration as u128);
+                                        println!(
+                                            "⏱️ Path metric from {}: {:.3} ms",
+                                            peer_id,
+                                            duration as f64 / 1000.0
+                                        );
                                     }
                                     continue;
                                 }

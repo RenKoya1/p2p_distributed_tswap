@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// タスク計測情報
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -269,6 +269,111 @@ impl std::fmt::Display for TaskStatistics {
             self.max_total_time,
             self.min_processing_time,
             self.max_processing_time,
+        )
+    }
+}
+
+/// Path computation metrics shared between centralized and decentralized managers.
+#[derive(Default, Debug, Clone)]
+pub struct PathComputationMetrics {
+    samples: Vec<u128>, // microseconds
+}
+
+impl PathComputationMetrics {
+    pub fn new() -> Self {
+        Self {
+            samples: Vec::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    /// Record a new duration sample using a [`Duration`].
+    pub fn record_duration(&mut self, duration: Duration) {
+        self.samples.push(duration.as_micros());
+    }
+
+    /// Record a new sample directly in microseconds.
+    pub fn record_micros(&mut self, micros: u128) {
+        self.samples.push(micros);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn get_statistics(&self) -> Option<PathComputationStatistics> {
+        if self.samples.is_empty() {
+            return None;
+        }
+
+        let mut sorted = self.samples.clone();
+        sorted.sort_unstable();
+
+        let sum: u128 = sorted.iter().sum();
+        let avg = sum as f64 / sorted.len() as f64;
+        let min = *sorted.first().unwrap();
+        let max = *sorted.last().unwrap();
+
+        Some(PathComputationStatistics {
+            samples: sorted.len(),
+            avg_micros: avg,
+            min_micros: min,
+            max_micros: max,
+        })
+    }
+
+    pub fn to_csv_string(&self) -> String {
+        let mut csv = String::from("sample_index,duration_micros,duration_millis\n");
+        for (idx, &sample) in self.samples.iter().enumerate() {
+            let millis = sample as f64 / 1000.0;
+            csv.push_str(&format!("{idx},{sample},{millis:.3}\n"));
+        }
+        csv
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PathComputationStatistics {
+    pub samples: usize,
+    pub avg_micros: f64,
+    pub min_micros: u128,
+    pub max_micros: u128,
+}
+
+impl PathComputationStatistics {
+    pub fn avg_millis(&self) -> f64 {
+        self.avg_micros / 1000.0
+    }
+
+    pub fn min_millis(&self) -> f64 {
+        self.min_micros as f64 / 1000.0
+    }
+
+    pub fn max_millis(&self) -> f64 {
+        self.max_micros as f64 / 1000.0
+    }
+}
+
+impl std::fmt::Display for PathComputationStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "⏱️ Path Computation Stats:\n\
+            ├─ Samples: {}\n\
+            ├─ Avg: {:.3} ms\n\
+            ├─ Min: {:.3} ms\n\
+            └─ Max: {:.3} ms",
+            self.samples,
+            self.avg_millis(),
+            self.min_millis(),
+            self.max_millis()
         )
     }
 }
