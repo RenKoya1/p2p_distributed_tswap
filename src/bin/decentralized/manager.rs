@@ -11,7 +11,7 @@ use p2p_distributed_tswap::map::task_metrics::{
 };
 
 use std::collections::HashMap;
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -41,12 +41,16 @@ struct MapdBehaviour {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Check for --clean flag to ignore mDNS discoveries
+    // Check for --clean flag - it clears old state but still accepts new connections
     let args: Vec<String> = std::env::args().collect();
-    let ignore_mdns = args.contains(&"--clean".to_string());
+    let _clean_mode = args.contains(&"--clean".to_string());
 
-    if ignore_mdns {
-        println!("🧹 Running in CLEAN mode - ignoring mDNS discoveries");
+    // Check for auto-save file paths from environment variables
+    let task_csv_path = std::env::var("TASK_CSV_PATH").ok();
+    let path_csv_path = std::env::var("PATH_CSV_PATH").ok();
+
+    if _clean_mode {
+        println!("🧹 Running in CLEAN mode - starting with fresh state");
     }
 
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
@@ -64,16 +68,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
 
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_millis(500)) // Heartbeat every 500ms
-                .heartbeat_initial_delay(Duration::from_millis(100)) // Initial heartbeat after 100ms (immediate mesh construction)
-                .mesh_n_low(1) // Minimum mesh peers set to 1 (default 4)
-                .mesh_n(2) // Target mesh peers set to 2 (default 6)
-                .mesh_n_high(3) // Maximum mesh peers set to 3 (default 12)
+                .heartbeat_interval(Duration::from_secs(2)) // 500ms→2秒: CPU使用量削減
+                .heartbeat_initial_delay(Duration::from_millis(500)) // 初期遅延延長
+                .mesh_n_low(1) // 最小メッシュ: 1対多なので1で十分
+                .mesh_n(1) // 目標メッシュ: Manager中心の星型トポロジー
+                .mesh_n_high(2) // 最大メッシュ削減
                 .validation_mode(gossipsub::ValidationMode::Permissive)
                 .message_id_fn(message_id_fn)
-                .history_length(5)  // メッセージ履歴を5に制限（デフォルト5だが明示）
-                .history_gossip(3)  // Gossip履歴を3に制限（デフォルト3だが明示）
-                .max_transmit_size(1_048_576)  // 最大送信サイズを1MBに制限
+                .history_length(3) // メッセージ履歴を3に削減（メモリ節約）
+                .history_gossip(1) // Gossip履歴を1に削減
+                .max_transmit_size(262_144) // 256KB: タスク送信には十分
+                .max_ihave_length(100) // IHAVEメッセージ制限
+                .max_ihave_messages(10) // IHAVEメッセージ数制限
                 .build()
                 .map_err(io::Error::other)?;
 
@@ -136,6 +142,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Track current position of each agent: peer_id -> (x, y)
     let mut peer_positions: HashMap<String, (usize, usize)> = HashMap::new();
 
+    // 定期的なクリーンアップ用タイマー
+    let mut last_cleanup = std::time::Instant::now();
+    let cleanup_interval = Duration::from_secs(30);
+
     // === Task Metrics Collection ===
     let mut metrics_collector = TaskMetricsCollector::new();
     let mut path_metrics = PathComputationMetrics::new();
@@ -144,6 +154,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         select! {
+            // 定期的なメモリクリーンアップ（30秒ごと）
+            _ = tokio::time::sleep(Duration::from_secs(1)), if last_cleanup.elapsed() > cleanup_interval => {
+                // peer_positions のサイズ制限（TSWAP視界範囲ベース: 60個程度）
+                const TSWAP_RADIUS: usize = 15;
+                let max_peer_positions = TSWAP_RADIUS * 4;  // 60個
+                if peer_positions.len() > max_peer_positions {
+                    let to_remove: Vec<String> = peer_positions.keys()
+                        .take(peer_positions.len() - max_peer_positions)
+                        .cloned()
+                        .collect();
+                    for key in to_remove {
+                        peer_positions.remove(&key);
+                    }
+                }
+
+                // known_peers/subscribed_peers のサイズ制限（最大200ピア）
+                if known_peers.len() > 200 {
+                    let to_remove: Vec<libp2p::PeerId> = known_peers.iter()
+                        .take(known_peers.len() - 200)
+                        .cloned()
+                        .collect();
+                    for peer in to_remove {
+                        known_peers.remove(&peer);
+                        subscribed_peers.remove(&peer);
+                        peer_task_map.remove(&peer);
+                    }
+                }
+
+                // 完了したタスクをクリーンアップ
+                let active_task_ids: HashSet<u64> = peer_task_map.values()
+                    .filter_map(|t| t.as_ref().and_then(|task| task.task_id))
+                    .collect();
+                task_peer_map.retain(|task_id, _| active_task_ids.contains(task_id));
+
+                println!("🧹 [CLEANUP] Active peers: {}, Subscribed: {}, Active tasks: {}",
+                         known_peers.len(), subscribed_peers.len(), task_peer_map.len());
+                last_cleanup = std::time::Instant::now();
+            }
+
             Ok(Some(line)) = stdin.next_line() => {
                 let trimmed = line.trim();
 
@@ -195,6 +244,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         Err(e) => println!("⚠️  Failed to save metrics: {e:?}"),
                     }
                     continue;
+                }
+
+                // 終了コマンド
+                if trimmed == "quit" || trimmed == "exit" {
+                    println!("👋 Manager shutting down gracefully...");
+                    break;
                 }
 
                 // タスク分割・送信コマンド
@@ -341,29 +396,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    if ignore_mdns {
-                        // In clean mode, ignore all mDNS discoveries
-                        for (peer_id, _multiaddr) in list {
-                            println!("⏭️  Ignoring mDNS peer (--clean mode): {peer_id}");
-                        }
-                    } else {
-                        for (peer_id, _multiaddr) in list {
-                            println!("mDNS discovered a new peer: {peer_id}");
+                    // 分散版マネージャー：全エージェントからメトリクスを収集するため、全ピアを受け入れる
+                    // ピア数制限なし（スケーラビリティ評価のため）
+                    for (peer_id, _multiaddr) in list.iter() {
+                        if !known_peers.contains(&peer_id) {
+                            println!("mDNS discovered a new peer: {} (total: {})",
+                                    &peer_id.to_base58()[..8], known_peers.len() + 1);
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             known_peers.insert(peer_id.clone());
                             peer_task_map.entry(peer_id.clone()).or_insert(None);
 
-                            // 少し待ってからGossipsubの購読状態をチェック
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-
-                            // ピアがトピックに購読しているかチェック
-                            for peer_info in swarm.behaviour_mut().gossipsub.all_peers() {
-                                if peer_info.0 == &peer_id && peer_info.1.iter().any(|t| t.as_str() == "mapd") {
-                                    subscribed_peers.insert(peer_id.clone());
-                                    println!("   ✅ Peer {} is already subscribed to 'mapd'", peer_id);
-                                    break;
-                                }
-                            }
+                            // 購読状態は後でGossipsubイベントで確認
+                            // （即座にチェックしても、まだ購読メッセージが到着していない可能性がある）
                         }
                     }
                 },
@@ -522,4 +566,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+
+    // Auto-save metrics on exit if environment variables are set
+    if let Some(path) = task_csv_path {
+        let csv_content = metrics_collector.to_csv_string();
+        match std::fs::write(&path, csv_content) {
+            Ok(_) => println!("💾 Auto-saved task metrics to {}", path),
+            Err(e) => println!("⚠️  Failed to auto-save task metrics: {e:?}"),
+        }
+    }
+
+    if let Some(path) = path_csv_path {
+        match std::fs::write(&path, path_metrics.to_csv_string()) {
+            Ok(_) => println!("💾 Auto-saved path metrics to {}", path),
+            Err(e) => println!("⚠️  Failed to auto-save path metrics: {e:?}"),
+        }
+    }
+
+    Ok(())
 }

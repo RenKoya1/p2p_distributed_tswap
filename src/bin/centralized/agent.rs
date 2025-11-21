@@ -88,16 +88,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
 
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_millis(250))
-                .heartbeat_initial_delay(Duration::from_millis(100))
-                .mesh_n_low(1)
-                .mesh_n(2)
-                .mesh_n_high(3)
+                .heartbeat_interval(Duration::from_secs(3)) // 250ms→3秒: Agent側はさらに長く
+                .heartbeat_initial_delay(Duration::from_secs(1)) // 初期遅延を1秒に
+                .mesh_n_low(1) // Managerとのみ接続
+                .mesh_n(1) // メッシュサイズ1: Manager 1対1接続
+                .mesh_n_high(1) // 最大1: 他のAgentとメッシュ形成しない
                 .validation_mode(gossipsub::ValidationMode::Permissive)
                 .message_id_fn(message_id_fn)
-                .history_length(5)  // メッセージ履歴を5に制限（デフォルト5だが明示）
-                .history_gossip(3)  // Gossip履歴を3に制限（デフォルト3だが明示）
-                .max_transmit_size(1_048_576)  // 最大送信サイズを1MBに制限
+                .history_length(2) // 最小履歴: Agentは履歴不要
+                .history_gossip(1) // Gossip履歴最小化
+                .max_transmit_size(131_072) // 128KB: 位置更新には十分
+                .max_ihave_length(50) // IHAVE制限を半分に
+                .max_ihave_messages(5) // IHAVEメッセージ数削減
                 .build()
                 .map_err(io::Error::other)?;
 
@@ -124,7 +126,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut my_point: Option<Point> = None;
     let grid = parse_map();
 
-    println!("[Initial Position] Waiting for mDNS discovery...");
+    println!("[Initial Position] Agent will NOT connect to other agents via mDNS");
+    println!("[Initial Position] Only Manager will discover and connect to this agent");
     let wait_duration = Duration::from_secs(3);
     let wait_start = std::time::Instant::now();
 
@@ -137,11 +140,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await
         {
             Ok(event) => match event {
-                SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    for (peer_id, _multiaddr) in &list {
-                        println!("[Initial Position] mDNS discovered: {peer_id}");
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                    }
+                SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(_list))) => {
+                    // Agent同士の接続を防ぐため、mDNS発見を完全に無視
+                    // Managerだけがadd_explicit_peerを使用してエージェントに接続
                 }
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("🎧 Listening on {address}");
@@ -181,7 +182,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("✅ [READY] Simple Agent is ready!");
     println!("⏳ Waiting for peers and Gossipsub mesh formation...");
 
-    // ピアとの接続とGossipsub mesh形成を待つ
+    // Managerとの接続とGossipsub mesh形成を待つ
     let discovery_start = std::time::Instant::now();
     let discovery_duration = Duration::from_secs(8);
     let mut subscribed_peers_count = 0;
@@ -189,11 +190,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     while discovery_start.elapsed() < discovery_duration {
         match tokio::time::timeout(Duration::from_millis(500), swarm.select_next_some()).await {
             Ok(event) => match event {
-                SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    for (peer_id, _) in list {
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                        println!("🔍 [AGENT] Discovered peer: {}", &peer_id.to_base58()[..8]);
-                    }
+                SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(_list))) => {
+                    // Agent同士の接続を防ぐため、mDNS発見を完全に無視
+                    // Managerだけがこのエージェントに接続する
                 }
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(
                     gossipsub::Event::Subscribed { peer_id, .. },
@@ -231,8 +230,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 初期位置をマネージャーに複数回送信（確実に届くように）
     if let Some(p) = my_point {
-        println!("📡 Broadcasting initial position {} times...", 10);
-        for i in 0..10 {
+        println!("📡 Broadcasting initial position {} times...", 3);
+        for i in 0..3 {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -264,7 +263,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await; // 300ms→500ms
         }
         println!("✅ Initial position broadcast complete!");
     }
@@ -283,8 +282,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            _ = tokio::time::sleep(Duration::from_millis(250)), if last_position_broadcast.elapsed() > Duration::from_millis(500) => {
-                // 定期的に位置情報をマネージャーに送信
+            _ = tokio::time::sleep(Duration::from_millis(500)), if last_position_broadcast.elapsed() > Duration::from_secs(1) => {
+                // 定期的に位置情報をマネージャーに送信（頻度を下げてネットワーク負荷削減）
                 if let Some(p) = my_point {
                     broadcast_position(&mut swarm, &topic, &local_peer_id_str, p);
                 }
@@ -295,17 +294,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("🎧 Listening on {address}");
                 }
-                SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    for (peer_id, _multiaddr) in list {
-                        println!("🔍 mDNS discovered: {peer_id}");
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                    }
+                SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(_list))) => {
+                    // Agent同士の接続を防ぐため、mDNS発見を完全に無視
                 },
-                SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                    for (peer_id, _multiaddr) in list {
-                        println!("⏰ mDNS expired: {peer_id}");
-                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                    }
+                SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Expired(_list))) => {
+                    // Agent同士の接続を防ぐため、mDNS expiredも無視
                 },
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
                     println!("🔗 [AGENT] Peer {} subscribed to topic: {}", peer_id, topic);
@@ -327,6 +320,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     println!("🚶 Moving: {:?} -> {:?}", my_point.unwrap(), next_pos);
                                                 }
                                                 my_point = Some(next_pos);
+                                                // 移動後、即座に新しい位置をマネージャーに通知
+                                                broadcast_position(&mut swarm, &topic, &local_peer_id_str, next_pos);
                                             }
                                         }
                                     }

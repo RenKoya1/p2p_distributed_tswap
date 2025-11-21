@@ -377,3 +377,100 @@ impl std::fmt::Display for PathComputationStatistics {
         )
     }
 }
+
+/// Network communication metrics for scalability evaluation
+#[derive(Default, Debug, Clone)]
+pub struct NetworkMetrics {
+    pub messages_sent: u64,
+    pub messages_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub start_time: Option<std::time::Instant>,
+}
+
+impl NetworkMetrics {
+    pub fn new() -> Self {
+        Self {
+            messages_sent: 0,
+            messages_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            start_time: Some(std::time::Instant::now()),
+        }
+    }
+
+    pub fn record_sent(&mut self, bytes: usize) {
+        self.messages_sent += 1;
+        self.bytes_sent += bytes as u64;
+    }
+
+    pub fn record_received(&mut self, bytes: usize) {
+        self.messages_received += 1;
+        self.bytes_received += bytes as u64;
+    }
+
+    pub fn get_elapsed_secs(&self) -> f64 {
+        self.start_time
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    pub fn get_send_rate(&self) -> f64 {
+        let elapsed = self.get_elapsed_secs();
+        if elapsed > 0.0 {
+            self.messages_sent as f64 / elapsed
+        } else {
+            0.0
+        }
+    }
+
+    pub fn get_recv_rate(&self) -> f64 {
+        let elapsed = self.get_elapsed_secs();
+        if elapsed > 0.0 {
+            self.messages_received as f64 / elapsed
+        } else {
+            0.0
+        }
+    }
+
+    pub fn get_bandwidth_sent_kbps(&self) -> f64 {
+        let elapsed = self.get_elapsed_secs();
+        if elapsed > 0.0 {
+            (self.bytes_sent as f64 * 8.0) / (elapsed * 1000.0)
+        } else {
+            0.0
+        }
+    }
+
+    pub fn get_bandwidth_recv_kbps(&self) -> f64 {
+        let elapsed = self.get_elapsed_secs();
+        if elapsed > 0.0 {
+            (self.bytes_received as f64 * 8.0) / (elapsed * 1000.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "📡 Network Communication Stats:\n\
+            ├─ Messages sent: {} ({:.1} msg/s)\n\
+            ├─ Messages received: {} ({:.1} msg/s)\n\
+            ├─ Bandwidth sent: {:.2} KB ({:.1} kbps)\n\
+            ├─ Bandwidth received: {:.2} KB ({:.1} kbps)\n\
+            └─ Duration: {:.1}s",
+            self.messages_sent,
+            self.get_send_rate(),
+            self.messages_received,
+            self.get_recv_rate(),
+            self.bytes_sent as f64 / 1024.0,
+            self.get_bandwidth_sent_kbps(),
+            self.bytes_received as f64 / 1024.0,
+            self.get_bandwidth_recv_kbps(),
+            self.get_elapsed_secs()
+        )
+    }
+}

@@ -2,14 +2,14 @@
 set -euo pipefail
 
 ##############################################################################
-# Decentralized MAPD Test (time-boxed with metric export)
+# Decentralized MAPD System Test (TSWAP-based with metric export)
 ##############################################################################
 
 NUM_AGENTS=${1:-3}
 DURATION_SECS=${2:-20}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS_DIR="${SCRIPT_DIR}/results/decentralized_$(date +%Y%m%d_%H%M%S)"
+RESULTS_DIR="${SCRIPT_DIR}/results/decentralized_${NUM_AGENTS}agents_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${RESULTS_DIR}"
 
 TASK_CSV="${RESULTS_DIR}/task_metrics.csv"
@@ -25,15 +25,22 @@ cleanup() {
     for pid in "${AGENT_PIDS[@]:-}"; do
         kill "${pid}" 2>/dev/null || true
     done
-    [[ -n "${MANAGER_PID:-}" ]] && kill "${MANAGER_PID}" 2>/dev/null || true
+    # Manager will be shut down gracefully by quit command in main script
+    # Only kill it here if script fails prematurely
+    if [[ "${GRACEFUL_SHUTDOWN:-}" != "true" ]]; then
+        [[ -n "${MANAGER_PID:-}" ]] && kill "${MANAGER_PID}" 2>/dev/null || true
+    fi
+    # Close file descriptor 3 if still open
+    exec 3>&- 2>/dev/null || true
     rm -f "${MANAGER_FIFO}"
 }
 trap cleanup EXIT
 
 echo ""
-echo "🌐 Decentralized MAPD Test"
+echo "🌐 Decentralized MAPD Test (TSWAP)"
 echo "   Agents   : ${NUM_AGENTS}"
 echo "   Duration : ${DURATION_SECS}s"
+echo "   TSWAP Radius: 15 (Manhattan distance)"
 echo "   Results  : ${RESULTS_DIR}"
 echo ""
 
@@ -44,72 +51,141 @@ echo "🧵 Preparing manager input pipe..."
 rm -f "${MANAGER_FIFO}"
 mkfifo "${MANAGER_FIFO}"
 
-echo "🏁 Launching manager (clean mode)..."
-cargo run --quiet --bin manager-decentralized -- --clean < "${MANAGER_FIFO}" > "${MANAGER_LOG}" 2>&1 &
+# Keep FIFO open with a background holder process
+exec 3<>"${MANAGER_FIFO}"  # File descriptor 3 keeps the FIFO open
+
+echo "🏁 Launching manager..."
+TASK_CSV_PATH="${TASK_CSV}" PATH_CSV_PATH="${PATH_CSV}" \
+    cargo run --quiet --bin manager-decentralized <&3 > "${MANAGER_LOG}" 2>&1 &
 MANAGER_PID=$!
-sleep 3
+sleep 2
 
 echo "🤖 Launching ${NUM_AGENTS} agents..."
-for i in $(seq 1 "${NUM_AGENTS}"); do
+for ((i=1; i<=NUM_AGENTS; i++)); do
     cargo run --quiet --bin agent-decentralized > "${RESULTS_DIR}/agent_${i}.log" 2>&1 &
     AGENT_PIDS+=($!)
-    sleep 0.1
+    
+    # エージェント起動の間隔を調整（ネットワーク負荷軽減）
+    if (( NUM_AGENTS >= 30 )); then
+        sleep 0.2  # 大規模な場合200ms
+    else
+        sleep 0.1  # 小規模な場合100ms
+    fi
 done
-echo "   ✅ Agents ready"
 
-echo "⏳ Allowing mesh formation..."
-sleep 10
+echo "✅ Launched ${NUM_AGENTS} agents (PIDs: ${AGENT_PIDS[*]})"
 
-echo "🚚 Dispatching tasks for ${DURATION_SECS}s..."
-(
-    sleep 2
-    while true; do
-        echo "task"
-        sleep 2
+# エージェント起動にかかった時間に基づいてウォームアップ時間を計算
+AGENT_LAUNCH_TIME=$(( (NUM_AGENTS * 2) / 10 ))  # 0.2s per agent for large scale
+WARMUP_SECS=$(( 10 + AGENT_LAUNCH_TIME ))  # エージェント初期化7秒 + 余裕3秒
+echo "⏳ Waiting ${WARMUP_SECS}s for agents to connect and mesh to form..."
+sleep "${WARMUP_SECS}"
+
+# マネージャーにタスクを送信（継続的に）
+echo "📤 Sending continuous tasks for ${DURATION_SECS}s..."
+{
+    # 最初にまとめて送る
+    echo "tasks ${NUM_AGENTS}"
+    sleep 5  # 初期タスクが配布されるのを待つ
+    
+    # その後、定期的に追加タスクを送信
+    ELAPSED=5
+    while (( ELAPSED < DURATION_SECS )); do
+        sleep 3
+        echo "tasks ${NUM_AGENTS}"
+        ELAPSED=$((ELAPSED + 3))
     done
-) > "${MANAGER_FIFO}" &
+} >&3 &
 SEND_PID=$!
 
+echo "⏱️  Running for ${DURATION_SECS}s..."
 sleep "${DURATION_SECS}"
+
+echo "🛑 Stopping task sender..."
 kill "${SEND_PID}" 2>/dev/null || true
 
-echo "📝 Collecting metrics..."
+echo "⏳ Waiting 3s for final tasks to complete..."
+sleep 3
+
+# Stop agents first
+echo "🛑 Stopping agents..."
+for pid in "${AGENT_PIDS[@]:-}"; do
+    kill "${pid}" 2>/dev/null || true
+done
+sleep 1
+
+# メトリクスを収集して終了
+echo "📊 Collecting metrics..."
 {
     echo "metrics"
     sleep 1
     echo "save ${TASK_CSV}"
-    sleep 0.5
+    sleep 1
     echo "save path ${PATH_CSV}"
     sleep 1
-} > "${MANAGER_FIFO}"
+    echo "quit"
+} >&3
 
-sleep 3
+# Close the FIFO file descriptor
+exec 3>&-
 
-echo ""
-echo "📊 Test summary"
-if [[ -f "${TASK_CSV}" ]]; then
-    TASK_COUNT=$(tail -n +2 "${TASK_CSV}" | wc -l | tr -d ' ')
-    AVG_TOTAL=$(awk -F',' 'NR>1 && $7 != "" {sum+=$7; count++} END {if(count>0) printf "%.1f", sum/count/1000;}' "${TASK_CSV}")
-    THROUGHPUT=$(awk -v dur="${DURATION_SECS}" -v cnt="${TASK_COUNT:-0}" 'BEGIN {if(dur>0) printf "%.2f", cnt/dur; else print "0.00";}')
-    echo "   ✅ Completed tasks : ${TASK_COUNT}"
-    echo "   ⚡ Throughput      : ${THROUGHPUT} tasks/sec"
-    if [[ -n "${AVG_TOTAL}" ]]; then
-        echo "   🕒 Avg task latency : ${AVG_TOTAL} s"
-    fi
-else
-    echo "   ⚠️  Task metrics CSV missing (${TASK_CSV})"
+METRICS_PID=""
+
+# Wait for manager to finish gracefully (with timeout)
+timeout=10
+elapsed=0
+while kill -0 "${MANAGER_PID}" 2>/dev/null && (( elapsed < timeout )); do
+    sleep 1
+    ((elapsed++))
+done
+
+# If still running, force kill
+if kill -0 "${MANAGER_PID}" 2>/dev/null; then
+    echo "⚠️  Manager didn't exit gracefully, forcing termination..."
+    kill "${MANAGER_PID}" 2>/dev/null || true
 fi
 
-if [[ -f "${PATH_CSV}" ]]; then
-    PATH_COUNT=$(tail -n +2 "${PATH_CSV}" | wc -l | tr -d ' ')
-    AVG_PATH=$(awk -F',' 'NR>1 {sum+=$3; count++} END {if(count>0) printf "%.3f", sum/count;}' "${PATH_CSV}")
-    echo "   ⏱️  Path samples    : ${PATH_COUNT:-0}"
-    if [[ -n "${AVG_PATH}" ]]; then
-        echo "   ⏱️  Avg plan time    : ${AVG_PATH} ms"
+GRACEFUL_SHUTDOWN=true
+
+echo "✅ Metrics saved"
+
+# サマリーを表示
+SUMMARY_FILE="${RESULTS_DIR}/test_summary.txt"
+{
+    echo "========================================="
+    echo "Decentralized MAPD Test Summary (TSWAP)"
+    echo "========================================="
+    echo "Agents      : ${NUM_AGENTS}"
+    echo "Duration    : ${DURATION_SECS}s"
+    echo "TSWAP Radius: 15"
+    echo ""
+    echo "Results:"
+    echo "---------"
+    
+    if [[ -f "${TASK_CSV}" ]]; then
+        COMPLETED=$(awk -F',' 'NR>1 && $5!="" {count++} END {print count+0}' "${TASK_CSV}")
+        echo "   ✅ Completed tasks : ${COMPLETED}"
+        
+        if (( COMPLETED > 0 )); then
+            THROUGHPUT=$(awk -v c="${COMPLETED}" -v d="${DURATION_SECS}" 'BEGIN {printf "%.2f", c/d}')
+            echo "   ⚡ Throughput      : ${THROUGHPUT} tasks/sec"
+        fi
     fi
-else
-    echo "   ⚠️  Path metrics CSV missing (${PATH_CSV})"
-fi
+    
+    if [[ -f "${PATH_CSV}" ]]; then
+        SAMPLES=$(awk -F',' 'NR>1 {count++} END {print count+0}' "${PATH_CSV}")
+        if (( SAMPLES > 0 )); then
+            AVG_TIME=$(awk -F',' 'NR>1 {sum+=$2; count++} END {if(count>0) printf "%.3f", sum/count}' "${PATH_CSV}")
+            echo "   ⏱️  Path samples    : ${SAMPLES}"
+            echo "   ⏱️  Avg plan time    : ${AVG_TIME} ms (per-agent TSWAP computation)"
+        fi
+    fi
+    
+    echo ""
+    echo "📁 Detailed results: ${RESULTS_DIR}"
+    echo "========================================="
+} | tee "${SUMMARY_FILE}"
 
 echo ""
-echo "Logs and CSVs stored in ${RESULTS_DIR}"
+echo "🎉 Test complete!"
+echo ""

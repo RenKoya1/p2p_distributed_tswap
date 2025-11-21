@@ -18,7 +18,7 @@ else
     pkill -9 -f "target/debug/agent"
     pkill -9 -f "target/debug/manager"
     sleep 1
-fi
+fi　
 
 echo "🧹 [3/3] Starting Manager in CLEAN mode (ignoring old mDNS peers)..."
 echo ""

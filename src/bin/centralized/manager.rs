@@ -40,6 +40,31 @@ struct Node {
     neighbors: Vec<usize>,
 }
 
+// TSWAP用のエージェント構造体
+#[derive(Clone, Copy, Debug)]
+struct TswapAgent {
+    id: usize,
+    v: usize, // current Node id
+    g: usize, // goal Node id
+}
+
+impl PartialEq for TswapAgent {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for TswapAgent {}
+impl PartialOrd for TswapAgent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TswapAgent {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+
 // マネージャーからエージェントへの移動指示
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MoveInstruction {
@@ -72,6 +97,168 @@ struct MapdBehaviour {
     mdns: mdns::tokio::Behaviour,
 }
 
+// TSWAP中央集権的な経路計画
+fn plan_all_paths(
+    agents: &mut [AgentState],
+    pos2id: &HashMap<Point, usize>,
+    nodes: &[Node],
+    _came_from_cache: &mut HashMap<usize, usize>,
+    _g_score_cache: &mut HashMap<usize, usize>,
+) -> Vec<MoveInstruction> {
+    let mut instructions = vec![];
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // AgentStateをTswapAgentに変換
+    let mut tswap_agents: Vec<TswapAgent> = agents
+        .iter()
+        .enumerate()
+        .map(|(i, agent)| {
+            let v = pos2id.get(&agent.current_pos).copied().unwrap_or(0);
+            let g = agent
+                .goal_pos
+                .and_then(|goal| pos2id.get(&goal).copied())
+                .unwrap_or(v);
+            TswapAgent { id: i, v, g }
+        })
+        .collect();
+
+    // TSWAPステップを実行
+    tswap_step(&mut tswap_agents, nodes);
+
+    // 結果をAgentStateとMoveInstructionに反映
+    for (i, tswap_agent) in tswap_agents.iter().enumerate() {
+        let next_pos = nodes[tswap_agent.v].pos;
+        agents[i].current_pos = next_pos;
+
+        instructions.push(MoveInstruction {
+            peer_id: agents[i].peer_id.clone(),
+            next_pos,
+            timestamp,
+        });
+    }
+
+    instructions
+}
+
+// TSWAPアルゴリズムの1ステップ
+fn tswap_step(agents: &mut [TswapAgent], nodes: &[Node]) {
+    let n = agents.len();
+
+    // TSWAP Goal Swapping Phase
+    // Rule 3: If agent j is at its goal, swap goals
+    // Rule 4: Deadlock detection and target rotation
+    for i in 0..n {
+        // Rule 1: Stay at goal
+        if agents[i].v == agents[i].g {
+            continue;
+        }
+
+        let path = get_path(agents[i].v, agents[i].g, nodes);
+        if path.len() < 2 {
+            continue;
+        }
+        let u = path[1]; // Desired next node
+
+        if let Some(j) = agents.iter().position(|b| b.v == u) {
+            if i == j {
+                continue;
+            }
+
+            // Rule 3: Goal swap when agent j is at its goal
+            if agents[j].v == agents[j].g {
+                let g_i = agents[i].g;
+                let g_j = agents[j].g;
+                agents[i].g = g_j;
+                agents[j].g = g_i;
+            } else {
+                // Rule 4: Deadlock detection and resolution
+                let mut a_p = vec![i];
+                let mut current_b_idx = j;
+                let mut deadlock_found = false;
+
+                loop {
+                    let b_v = agents[current_b_idx].v;
+                    let b_g = agents[current_b_idx].g;
+
+                    if b_v == b_g {
+                        break;
+                    }
+
+                    let b_path = get_path(b_v, b_g, nodes);
+                    if b_path.len() < 2 {
+                        break;
+                    }
+                    let w = b_path[1];
+
+                    if let Some(c_idx) = agents.iter().position(|c| c.v == w) {
+                        if a_p.contains(&current_b_idx) {
+                            a_p.clear();
+                            break;
+                        }
+                        a_p.push(current_b_idx);
+                        current_b_idx = c_idx;
+
+                        if current_b_idx == i {
+                            deadlock_found = true;
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                // Rule 4: Rotate targets when deadlock is detected
+                if deadlock_found && a_p.len() > 1 {
+                    let first_agent_idx = a_p[0];
+                    let last_goal = agents[a_p[a_p.len() - 1]].g;
+                    for k in (1..a_p.len()).rev() {
+                        let prev_g = agents[a_p[k - 1]].g;
+                        agents[a_p[k]].g = prev_g;
+                    }
+                    agents[first_agent_idx].g = last_goal;
+                }
+            }
+        }
+    }
+
+    // TSWAP Movement Phase
+    // Rule 2: Move to next node if possible
+    // Rule 5: Stay if next node is occupied
+    for i in 0..n {
+        if agents[i].v == agents[i].g {
+            continue;
+        }
+
+        let path = get_path(agents[i].v, agents[i].g, nodes);
+        if path.len() < 2 {
+            continue;
+        }
+        let u = path[1];
+
+        // Check if next position is available or can be swapped
+        if let Some(j) = agents.iter().position(|b| b.v == u) {
+            if i != j {
+                // Check for mutual swap (both agents want each other's positions)
+                let path_j = get_path(agents[j].v, agents[j].g, nodes);
+                if path_j.len() >= 2 && path_j[1] == agents[i].v {
+                    // Mutual swap: exchange positions simultaneously
+                    let temp_v = agents[i].v;
+                    agents[i].v = agents[j].v;
+                    agents[j].v = temp_v;
+                }
+                // Rule 5: Otherwise stay (next node is occupied)
+            }
+        } else {
+            // Rule 2: Next node is free, move to it
+            agents[i].v = u;
+        }
+    }
+}
+
+// TSWAPで使用する経路探索（A*）
 fn get_path(start: usize, goal: usize, nodes: &[Node]) -> Vec<usize> {
     if start == goal {
         return vec![start];
@@ -162,99 +349,19 @@ fn get_path(start: usize, goal: usize, nodes: &[Node]) -> Vec<usize> {
         }
     }
 
-    vec![start]
-}
+    // No path found, return best neighbor
+    let mut best_neighbor = start;
+    let mut min_dist = heuristic(start);
 
-// 中央集権的な経路計画（衝突回避付き）
-fn plan_all_paths(
-    agents: &mut [AgentState],
-    pos2id: &HashMap<Point, usize>,
-    nodes: &[Node],
-) -> Vec<MoveInstruction> {
-    let mut instructions = vec![];
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // この時間ステップで予約された位置を追跡
-    let mut reserved_positions: HashMap<Point, String> = HashMap::new();
-
-    // まず、ゴールにいるエージェントはその場に留まる
-    for agent in agents.iter() {
-        if let Some(goal) = agent.goal_pos {
-            if agent.current_pos == goal {
-                reserved_positions.insert(agent.current_pos, agent.peer_id.clone());
-            }
+    for &neighbor_id in &nodes[start].neighbors {
+        let dist = heuristic(neighbor_id);
+        if dist < min_dist {
+            min_dist = dist;
+            best_neighbor = neighbor_id;
         }
     }
 
-    // 次に、ゴールにいないエージェントの移動を計画
-    for agent in agents.iter_mut() {
-        if let Some(goal) = agent.goal_pos {
-            if agent.current_pos == goal {
-                // ゴールで待機
-                instructions.push(MoveInstruction {
-                    peer_id: agent.peer_id.clone(),
-                    next_pos: agent.current_pos,
-                    timestamp,
-                });
-                continue;
-            }
-
-            // まだ経路が計算されていなければ計算
-            if agent.path.is_empty() {
-                if let (Some(&start_id), Some(&goal_id)) =
-                    (pos2id.get(&agent.current_pos), pos2id.get(&goal))
-                {
-                    let path_ids = get_path(start_id, goal_id, nodes);
-                    agent.path = path_ids.iter().map(|&id| nodes[id].pos).collect();
-                }
-            }
-
-            // 経路から次の位置を取得
-            if agent.path.len() > 1 {
-                let next_pos = agent.path[1];
-
-                // 次の位置が利用可能かチェック
-                if !reserved_positions.contains_key(&next_pos) {
-                    reserved_positions.insert(next_pos, agent.peer_id.clone());
-                    instructions.push(MoveInstruction {
-                        peer_id: agent.peer_id.clone(),
-                        next_pos,
-                        timestamp,
-                    });
-
-                    // エージェントの現在位置と経路を更新
-                    agent.current_pos = next_pos;
-                    agent.path.remove(0);
-                } else {
-                    // 衝突回避のため待機
-                    instructions.push(MoveInstruction {
-                        peer_id: agent.peer_id.clone(),
-                        next_pos: agent.current_pos,
-                        timestamp,
-                    });
-                }
-            } else {
-                // 経路なし、待機
-                instructions.push(MoveInstruction {
-                    peer_id: agent.peer_id.clone(),
-                    next_pos: agent.current_pos,
-                    timestamp,
-                });
-            }
-        } else {
-            // ゴールなし、待機
-            instructions.push(MoveInstruction {
-                peer_id: agent.peer_id.clone(),
-                next_pos: agent.current_pos,
-                timestamp,
-            });
-        }
-    }
-
-    instructions
+    vec![start, best_neighbor]
 }
 
 fn try_assign_pending_tasks<'a>(
@@ -357,13 +464,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
 
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_millis(500))
-                .heartbeat_initial_delay(Duration::from_millis(100))
-                .mesh_n_low(1)
-                .mesh_n(2)
-                .mesh_n_high(3)
-                .validation_mode(gossipsub::ValidationMode::Strict)
+                .heartbeat_interval(Duration::from_secs(2)) // 500ms→2秒: CPU使用量削減
+                .heartbeat_initial_delay(Duration::from_millis(500)) // 初期遅延も延長
+                .mesh_n_low(1) // 最小メッシュサイズ
+                .mesh_n(1) // 理想メッシュサイズ: 1対多なので1で十分
+                .mesh_n_high(2) // 最大メッシュサイズ削減
+                .validation_mode(gossipsub::ValidationMode::Permissive)
                 .message_id_fn(message_id_fn)
+                .history_length(3) // メッセージ履歴を3に削減（メモリ節約）
+                .history_gossip(1) // Gossip履歴を1に削減
+                .max_transmit_size(262_144) // 256KB: タスク送信には十分
+                .max_ihave_length(100) // IHAVE メッセージ制限
+                .max_ihave_messages(10) // IHAVE メッセージ数制限
                 .build()
                 .map_err(io::Error::other)?;
 
@@ -450,7 +562,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 定期的な経路計画
     let mut last_planning = std::time::Instant::now();
-    let planning_interval = Duration::from_millis(200);
+    // 平均計画時間が180msなので、余裕を持たせて300ms間隔に設定
+    // これにより、計画完了後に約120msの余裕ができる
+    let planning_interval = Duration::from_millis(500); // 300ms = 1秒に約3.3ステップ
+
+    // A*アルゴリズム用の再利用可能なHashMap（メモリ削減）
+    let mut astar_came_from: HashMap<usize, usize> = HashMap::with_capacity(1000);
+    let mut astar_g_score: HashMap<usize, usize> = HashMap::with_capacity(1000);
+
+    // 定期的なクリーンアップ用タイマー
+    let mut last_cleanup = std::time::Instant::now();
+    let cleanup_interval = Duration::from_secs(30);
 
     loop {
         select! {
@@ -550,24 +672,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             // 定期的な中央集権的経路計画
-            _ = tokio::time::sleep(Duration::from_millis(100)), if last_planning.elapsed() > planning_interval => {
+            _ = tokio::time::sleep(Duration::from_millis(50)), if last_planning.elapsed() >= planning_interval => {
                 if !agent_states.is_empty() {
                     let mut agents: Vec<AgentState> = agent_states.values().cloned().collect();
                     let num_agents = agents.len();
                     let plan_start = std::time::Instant::now();
-                    let instructions = plan_all_paths(&mut agents, &pos2id, &nodes);
+                    let instructions = plan_all_paths(&mut agents, &pos2id, &nodes, &mut astar_came_from, &mut astar_g_score);
                     let elapsed = plan_start.elapsed();
 
-                    // 公平な比較のため、各エージェントごとの平均時間を記録
-                    // 分散型では各エージェントが個別に計算するため、1エージェントあたりの時間で比較
-                    let per_agent_duration = elapsed / num_agents as u32;
-                    path_metrics.record_duration(per_agent_duration);
+                    // 1ステップの計算時間 = マネージャーが全エージェントの経路を計算する総時間
+                    // 集中型の特性：全エージェントを一度に処理する時間を測定
+                    path_metrics.record_duration(elapsed);
 
                     println!(
-                        "⏱️ Central path planning for {} agents took {:.3} ms (avg {:.3} ms/agent)",
+                        "⏱️ Central path planning for {} agents took {:.3} ms (interval: {:.3}ms)",
                         num_agents,
                         elapsed.as_secs_f64() * 1000.0,
-                        per_agent_duration.as_secs_f64() * 1000.0
+                        last_planning.elapsed().as_secs_f64() * 1000.0
                     );
 
                     // エージェント状態を更新
@@ -602,6 +723,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 last_planning = std::time::Instant::now();
             }
 
+            // 定期的なメモリクリーンアップ（30秒ごと）
+            _ = tokio::time::sleep(Duration::from_secs(1)), if last_cleanup.elapsed() > cleanup_interval => {
+                // 完了したタスクを持つエージェントをクリーンアップ
+                agent_states.retain(|_, state| {
+                    state.task_phase != TaskPhase::Idle || state.task.is_some()
+                });
+
+                // エージェント数制限（最大500エージェント）
+                if agent_states.len() > 500 {
+                    let to_remove: Vec<String> = agent_states.keys()
+                        .filter(|id| agent_states[*id].task_phase == TaskPhase::Idle)
+                        .take(agent_states.len() - 500)
+                        .cloned()
+                        .collect();
+                    for key in to_remove {
+                        agent_states.remove(&key);
+                    }
+                }
+
+                // 古いタスクマッピングをクリーンアップ
+                let active_task_ids: std::collections::HashSet<u64> = agent_states.values()
+                    .filter_map(|state| state.task.as_ref().and_then(|t| t.task_id))
+                    .collect();
+                task_peer_map.retain(|task_id, _| active_task_ids.contains(task_id));
+
+                // known_peers/subscribed_peersも制限
+                if known_peers.len() > 1000 {
+                    let to_remove: Vec<libp2p::PeerId> = known_peers.iter()
+                        .take(known_peers.len() - 1000)
+                        .cloned()
+                        .collect();
+                    for peer in to_remove {
+                        known_peers.remove(&peer);
+                        subscribed_peers.remove(&peer);
+                    }
+                }
+
+                println!("🧹 [CLEANUP] Active agents: {}, Active tasks: {}, Known peers: {}",
+                         agent_states.len(), task_peer_map.len(), known_peers.len());
+                last_cleanup = std::time::Instant::now();
+            }
+
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("🎧 Listening on {address}");
@@ -609,7 +772,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 SwarmEvent::Behaviour(MapdBehaviourEvent::Mdns(mdns::Event::Discovered(list))) if !ignore_mdns => {
                     for (peer_id, _multiaddr) in list {
                         if !known_peers.contains(&peer_id) {
-                            println!("🔍 mDNS discovered: {}", peer_id);
+                            println!("🔍 [MANAGER] mDNS discovered agent: {}", &peer_id.to_base58()[..8]);
+                            // Managerのみがエージェントを明示的にGossipsubメッシュに追加
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             known_peers.insert(peer_id);
                         }
@@ -708,31 +872,81 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             if let Some(task_id) = val.get("task_id").and_then(|v| v.as_u64()) {
                                 println!("✅ Task {} completed!", task_id);
 
-                                if let Some(peer_id_str) = task_peer_map.get(&task_id) {
+                                let completed_peer_id = if let Some(peer_id_str) = task_peer_map.get(&task_id) {
+                                    let peer_id = peer_id_str.clone();
                                     if let Some(agent) = agent_states.get_mut(peer_id_str) {
                                         agent.task = None;
                                         agent.goal_pos = None;
                                         agent.path.clear();
                                         agent.task_phase = TaskPhase::Idle;
+                                        println!("🔄 Agent {} is now available for new tasks", &peer_id[..std::cmp::min(8, peer_id.len())]);
                                     }
-                                }
+                                    Some(peer_id)
+                                } else {
+                                    None
+                                };
 
-                                let newly_assigned = try_assign_pending_tasks(
-                                    &mut pending_task_requests,
-                                    &mut agent_states,
-                                    &mut task_gen,
-                                    &mut metrics_collector,
-                                    &mut task_peer_map,
-                                    &mut swarm,
-                                    &topic,
-                                    &mut task_counter,
-                                );
-
-                                if newly_assigned > 0 {
-                                    println!(
-                                        "🚀 Assigned {} pending tasks after completion",
-                                        newly_assigned
+                                // 保留中のタスクがあれば優先的に割り当て
+                                if pending_task_requests > 0 {
+                                    let newly_assigned = try_assign_pending_tasks(
+                                        &mut pending_task_requests,
+                                        &mut agent_states,
+                                        &mut task_gen,
+                                        &mut metrics_collector,
+                                        &mut task_peer_map,
+                                        &mut swarm,
+                                        &topic,
+                                        &mut task_counter,
                                     );
+
+                                    if newly_assigned > 0 {
+                                        println!(
+                                            "🚀 Assigned {} pending tasks after completion (remaining: {})",
+                                            newly_assigned, pending_task_requests
+                                        );
+                                    }
+                                } else if let Some(peer_id) = completed_peer_id {
+                                    // 保留タスクがなくても、完了したエージェントに新しいタスクを生成して割り当て
+                                    if let Some(mut new_task) = task_gen.generate_task() {
+                                        task_counter += 1;
+                                        let new_task_id = task_counter;
+                                        new_task.peer_id = Some(peer_id.clone());
+                                        new_task.task_id = Some(new_task_id);
+
+                                        let metric = TaskMetric::new(new_task_id, peer_id.clone());
+                                        metrics_collector.add_metric(metric);
+
+                                        match serde_json::to_vec(&new_task) {
+                                            Ok(task_bytes) => match swarm
+                                                .behaviour_mut()
+                                                .gossipsub
+                                                .publish(topic.clone(), task_bytes)
+                                            {
+                                                Ok(_) => {
+                                                    if let Some(agent) = agent_states.get_mut(&peer_id) {
+                                                        agent.task = Some(new_task.clone());
+                                                        agent.goal_pos = Some(new_task.pickup);
+                                                        agent.path.clear();
+                                                        agent.task_phase = TaskPhase::MovingToPickup;
+                                                    }
+                                                    task_peer_map.insert(new_task_id, peer_id.clone());
+                                                    println!(
+                                                        "🔁 Auto-assigned new task {} to {} after completion",
+                                                        new_task_id,
+                                                        &peer_id[..std::cmp::min(8, peer_id.len())]
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    println!("⚠️  Failed to publish auto-assigned task: {e:?}");
+                                                }
+                                            },
+                                            Err(e) => {
+                                                println!("⚠️  Failed to serialize auto-assigned task: {e:?}");
+                                            }
+                                        }
+                                    } else {
+                                        println!("⚠️  No more tasks available to auto-assign");
+                                    }
                                 }
                             }
                         }
